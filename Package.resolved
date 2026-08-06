@@ -11,15 +11,6 @@
       }
     },
     {
-      "identity" : "containerization",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/apple/containerization.git",
-      "state" : {
-        "revision" : "7800b4642171561c95b5f55500b19e5dce5acd45",
-        "version" : "0.40.1"
-      }
-    },
-    {
       "identity" : "grpc-swift-2",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/grpc/grpc-swift-2.git",
