@@ -54,7 +54,9 @@ let package = Package(
         .library(name: "MachineAPIService", targets: ["MachineAPIService"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/containerization.git", exact: Version(stringLiteral: scVersion)),
+        // Pods ride the fork of containerization, whose union branch carries
+        // LinuxPod and the copy, swap, and kernel surfaces the runtime uses.
+        .package(url: "https://github.com/MayCXC/containerization.git", revision: "67e97e92d2843eaabb9d4b28d5edb3594a227e40"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.7.0"),
         .package(url: "https://github.com/apple/swift-collections.git", from: "1.2.0"),
         .package(url: "https://github.com/apple/swift-configuration", from: "1.0.0"),

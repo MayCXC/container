@@ -27,6 +27,7 @@ public struct Bundle: Sendable {
     private static let containerRootFsFilename = "rootfs.json"
 
     static let containerConfigFilename = "config.json"
+    static let podConfigFilename = "pod.json"
 
     /// The path to the bundle.
     public let path: URL
@@ -81,6 +82,22 @@ public struct Bundle: Sendable {
             try load(path: self.path.appendingPathComponent(Self.containerConfigFilename))
         }
     }
+
+    /// The configuration of the pod this bundle holds, when the bundle is a
+    /// pod's rather than a single container's.
+    public var podConfiguration: PodConfiguration {
+        get throws {
+            try load(path: self.path.appendingPathComponent(Self.podConfigFilename))
+        }
+    }
+
+    /// Whether this bundle holds a pod, whose containers keep bundles of their
+    /// own, rather than a single container.
+    public var isPod: Bool {
+        FileManager.default.fileExists(
+            atPath: self.path.appendingPathComponent(Self.podConfigFilename).path
+        )
+    }
 }
 
 extension Bundle {
@@ -89,6 +106,7 @@ extension Bundle {
         initialFilesystem: Filesystem,
         kernel: Kernel,
         containerConfiguration: ContainerConfiguration? = nil,
+        podConfiguration: PodConfiguration? = nil,
         containerRootFilesystem: Filesystem? = nil,
         options: ContainerCreateOptions? = nil
     ) throws -> Bundle {
@@ -116,6 +134,10 @@ extension Bundle {
             try bundle.write(filename: Self.containerConfigFilename, value: containerConfiguration)
         }
 
+        if let podConfiguration {
+            try bundle.write(filename: Self.podConfigFilename, value: podConfiguration)
+        }
+
         if let rootFsOverride = options?.rootFsOverride {
             try bundle.setContainerRootFs(fs: rootFsOverride)
         } else if let containerRootFilesystem {
@@ -134,6 +156,11 @@ extension Bundle {
     /// Set the value of the configuration for the Bundle.
     public func set(configuration: ContainerConfiguration) throws {
         try write(filename: Self.containerConfigFilename, value: configuration)
+    }
+
+    /// Set the value of the pod configuration for the Bundle.
+    public func set(podConfiguration: PodConfiguration) throws {
+        try write(filename: Self.podConfigFilename, value: podConfiguration)
     }
 
     /// Return the full filepath for a named resource in the Bundle.
