@@ -57,7 +57,7 @@ extension Application {
                 log.info("checking if APIServer is alive")
                 _ = try await ClientHealthCheck.ping(timeout: .seconds(5))
             } catch {
-                log.info("APIServer health check failed, skipping bootout")
+                log.info("APIServer health check failed, not asking it about containers")
                 running = false
             }
 
@@ -85,12 +85,24 @@ extension Application {
                         }
                         try await Task.sleep(for: .seconds(1))
                     }
-
-                    log.info("stopping service", metadata: ["label": "\(fullLabel)"])
-                    try ServiceManager.deregister(fullServiceLabel: fullLabel)
                 } catch {
                     log.warning("failed to wait for all containers", metadata: ["error": "\(error)"])
                 }
+            }
+
+            // Stopping the services is what this command is for, so it
+            // happens whether or not the containers could be waited for, and
+            // whether or not the API server answered its health check at all.
+            // Asking the API server about its containers is asking the
+            // service being stopped, and it is when that service is in a
+            // bad way that stopping it matters most: leaving it running
+            // because it could not answer leaves the one process that
+            // needed stopping.
+            log.info("stopping service", metadata: ["label": "\(fullLabel)"])
+            do {
+                try ServiceManager.deregister(fullServiceLabel: fullLabel)
+            } catch {
+                log.warning("failed to stop service", metadata: ["label": "\(fullLabel)", "error": "\(error)"])
             }
 
             // Note: The assumption here is that we would have registered the launchd services
