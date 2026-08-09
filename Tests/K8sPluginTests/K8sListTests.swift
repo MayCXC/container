@@ -49,6 +49,7 @@ private func makeSnapshot(
         {
             "configuration": {
                 "id": "\(id)",
+                "pod": "\(id)-pod",
                 "image": {
                     "reference": "docker.io/kindest/node:v1.35.5",
                     "descriptor": {"mediaType":"","digest":"\(sha)","size":0}
