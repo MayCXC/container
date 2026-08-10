@@ -20,6 +20,7 @@ import Containerization
 import ContainerizationError
 import ContainerizationOCI
 import Foundation
+import Logging
 
 /// A client for interacting with the container API server.
 ///
@@ -309,6 +310,43 @@ public struct ContainerClient: Sendable {
                 .internalError,
                 message: "failed to delete container",
                 cause: error
+            )
+        }
+    }
+
+    /// Discard the free blocks of a running container's root filesystem, so its
+    /// sparse backing file gives them back to the host rather than holding the
+    /// high water mark of everything ever written to it.
+    ///
+    /// This runs fstrim inside the container, where the container's own root
+    /// filesystem is `/`. The runtime's whole-filesystem operation acts in the
+    /// init namespace instead, on the mount the host names rather than the one
+    /// the container writes to, so it cannot reach the blocks the container
+    /// freed; fstrim in the container reaches them and the runtime forwards the
+    /// discards to hole punches in the backing file.
+    public func trim(id: String) async throws {
+        let container = try await self.get(id: id)
+        var config = container.configuration.initProcess
+        config.executable = "fstrim"
+        config.arguments = ["/"]
+        config.terminal = false
+
+        // The process is driven the way `exec` drives one: real stdio pipes and
+        // handleProcess to start it, pump its output, and wait for it. Created
+        // with no descriptors it is registered but never runs to completion.
+        let io = try ProcessIO.create(tty: false, interactive: false, detach: false)
+        defer { try? io.close() }
+        let process = try await self.createProcess(
+            containerId: id,
+            processId: UUID().uuidString.lowercased(),
+            configuration: config,
+            stdio: io.stdio
+        )
+        let code = try await io.handleProcess(process: process, log: Logger(label: "com.apple.container.trim"))
+        guard code == 0 else {
+            throw ContainerizationError(
+                .internalError,
+                message: "fstrim exited \(code) in container \(id)"
             )
         }
     }
