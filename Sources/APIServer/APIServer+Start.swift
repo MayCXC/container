@@ -88,6 +88,15 @@ extension APIServer {
                 await podsService.setNetworksService(networkService)
                 await containersService.setPodsService(podsService)
 
+                // Machines outlive the process that made them, so before
+                // serving, adopt the ones still running: pods dial their
+                // launchd services, containers take their machine's word.
+                // Adopting them first keeps a container that is still running
+                // out of the reap below, and lets the sweep stop a machine
+                // that is still running, through the client that adopted it.
+                await podsService.reconnect()
+                await containersService.reconnect()
+
                 // A container run to be removed on exit whose exit reached
                 // nobody goes now, taking the pod it was given; a pod a
                 // container was given that no container is in goes after.
