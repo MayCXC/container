@@ -64,7 +64,6 @@ public struct Application: AsyncLoggableCommand {
                     ContainerKill.self,
                     ContainerList.self,
                     ContainerLogs.self,
-                    ContainerRun.self,
                     ContainerStart.self,
                     ContainerStats.self,
                     ContainerStop.self,
@@ -89,12 +88,6 @@ public struct Application: AsyncLoggableCommand {
                 name: "Volume",
                 subcommands: [
                     VolumeCommand.self
-                ]
-            ),
-            CommandGroup(
-                name: "Pod",
-                subcommands: [
-                    PodCommand.self
                 ]
             ),
             CommandGroup(
