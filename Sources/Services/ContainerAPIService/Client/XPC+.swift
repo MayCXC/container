@@ -147,6 +147,10 @@ public enum XPCKeys: String {
     case statistics
     case containerSize
 
+    /// Filesystem trim: the backing file's allocation around it
+    case allocatedBeforeBytes
+    case allocatedAfterBytes
+
     /// Container list filters
     case listFilters
 
@@ -172,6 +176,7 @@ public enum XPCRoute: String {
     case containerDial
     case containerResize
     case containerKill
+    case containerTrim
     case containerState
     case containerLogs
     case containerEvent

@@ -271,6 +271,29 @@ extension RuntimeClient {
         }
     }
 
+    /// Trim a container's root filesystem; answers the allocation of the file
+    /// backing it before and after the discard.
+    public func trim(_ id: String) async throws -> (allocatedBefore: UInt64, allocatedAfter: UInt64) {
+        let request = self.request(RuntimeRoutes.trim.rawValue)
+        request.set(key: RuntimeKeys.id.rawValue, value: id)
+
+        do {
+            // Sized to the operation: a first trim walks every free extent of
+            // the filesystem, which can take tens of seconds on a large one.
+            let reply = try await self.client.send(request, responseTimeout: .seconds(300))
+            return (
+                allocatedBefore: reply.uint64(key: RuntimeKeys.allocatedBeforeBytes.rawValue),
+                allocatedAfter: reply.uint64(key: RuntimeKeys.allocatedAfterBytes.rawValue)
+            )
+        } catch {
+            throw ContainerizationError(
+                .internalError,
+                message: "failed to trim container \(id) in sandbox \(self.id)",
+                cause: error
+            )
+        }
+    }
+
     public func resize(_ id: String, size: Terminal.Size) async throws {
         let request = self.request(RuntimeRoutes.resize.rawValue)
         request.set(key: RuntimeKeys.id.rawValue, value: id)
