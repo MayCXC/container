@@ -38,7 +38,7 @@ public struct NetworkClient: Sendable {
     ///
     /// Pass a different value to ``init(serviceIdentifier:)`` to connect to an
     /// alternative service endpoint, for example during testing.
-    public static let defaultServiceIdentifier = "com.apple.container.apiserver"
+    public static let defaultServiceIdentifier = "com.apple.container.core.container-core-containers"
 
     /// The name of the default network created automatically on first use.
     public static let defaultNetworkName = "default"
@@ -102,6 +102,23 @@ public struct NetworkClient: Sendable {
             return []
         }
         return try JSONDecoder().decode([NetworkResource].self, from: resourceData)
+    }
+
+    /// Resolve a container hostname to its network attachment.
+    ///
+    /// - Parameter hostname: A canonical DNS hostname with a trailing dot.
+    /// - Returns: The attachment whose hostname matches, or nil when no
+    ///   network knows the name.
+    public func lookup(hostname: String) async throws -> Attachment? {
+        let request = XPCMessage(route: .networkLookup)
+        request.set(key: .hostname, value: hostname)
+
+        let response = try await xpcSend(message: request, timeout: .seconds(1))
+
+        guard let data = response.dataNoCopy(key: .attachment) else {
+            return nil
+        }
+        return try JSONDecoder().decode(Attachment.self, from: data)
     }
 
     /// Returns the network with the given identifier.
