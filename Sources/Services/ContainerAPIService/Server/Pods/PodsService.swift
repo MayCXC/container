@@ -118,6 +118,11 @@ public actor PodsService {
     }
 
     /// The pods on disk, which outlive the process that made them.
+    ///
+    /// A pod's bundle is materialized by its machine's first boot, so a pod
+    /// created and not yet booted has only the runtime configuration its
+    /// create wrote; the pod's own configuration is read from whichever of
+    /// the two holds it.
     static func loadAtBoot(root: URL, log: Logger) throws -> [String: PodState] {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         var pods: [String: PodState] = [:]
@@ -125,7 +130,15 @@ public actor PodsService {
         for entry in entries {
             do {
                 let bundle = ContainerResource.Bundle(path: entry)
-                let configuration = try bundle.podConfiguration
+                let configuration: PodConfiguration
+                if bundle.isPod {
+                    configuration = try bundle.podConfiguration
+                } else if let embedded = try RuntimeConfiguration.readRuntimeConfiguration(from: entry).podConfiguration {
+                    configuration = embedded
+                } else {
+                    log.warning("skipping a bundle that is not a pod's", metadata: ["path": "\(entry.path)"])
+                    continue
+                }
                 pods[configuration.id] = PodState(configuration: configuration)
             } catch {
                 log.warning("skipping unreadable pod", metadata: ["path": "\(entry.path)", "error": "\(error)"])
@@ -150,28 +163,35 @@ public actor PodsService {
     /// its machine first booted.
     public func reconnect() async {
         await self.lock.withLock(logMetadata: ["acquirer": "\(#function)"]) { context in
-            for (id, var state) in await self.pods {
+            let pods = await self.pods
+            self.log.info("looking for machines to adopt", metadata: ["pods": "\(pods.count)"])
+            for (id, var state) in pods {
                 guard state.client == nil else {
                     continue
                 }
                 let runtime = state.configuration.runtimeHandler
-                // The name probed is the name dialed: launchctl answers for
-                // the bare mach service label, not the domain-prefixed form
-                // bootout takes.
-                let label = RuntimeClient.machServiceLabel(runtime: runtime, id: id)
+                // launchctl answers for the service's bare label: not the
+                // domain-prefixed form bootout takes, and not the mach name
+                // the client dials, which carries the runtime prefix.
+                let label = "\(Self.machServicePrefix).\(runtime).\(id)"
                 guard (try? ServiceManager.isRegistered(fullServiceLabel: label)) == true else {
+                    self.log.info("no service answers for the pod", metadata: ["pod": "\(id)"])
                     continue
                 }
                 do {
                     let client = try await RuntimeClient.create(id: id, runtime: runtime)
                     let sandbox = try await client.state()
-                    if sandbox.status == .running {
-                        state.client = client
-                        state.state = .ready
-                        state.startedDate = sandbox.containers.compactMap { $0.startedDate }.min()
-                        await self.setPodState(id, state, context: context)
-                        self.log.info("adopted a running machine", metadata: ["pod": "\(id)"])
+                    guard sandbox.status == .running else {
+                        self.log.info(
+                            "a pod's machine answered but is not running",
+                            metadata: ["pod": "\(id)", "status": "\(sandbox.status)"])
+                        continue
                     }
+                    state.client = client
+                    state.state = .ready
+                    state.startedDate = sandbox.containers.compactMap { $0.startedDate }.min()
+                    await self.setPodState(id, state, context: context)
+                    self.log.info("adopted a running machine", metadata: ["pod": "\(id)"])
                 } catch {
                     self.log.warning(
                         "a pod's service answered launchd but not the runtime",
@@ -279,7 +299,6 @@ public actor PodsService {
                 podConfiguration: configuration
             )
             try runtimeConfig.writeRuntimeConfiguration()
-            try ContainerResource.Bundle(path: path).set(podConfiguration: configuration)
 
             await self.setPodState(configuration.id, PodState(configuration: configuration), context: context)
         }
@@ -329,7 +348,22 @@ public actor PodsService {
 
         try await self.lock.withLock(logMetadata: ["acquirer": "\(#function)", "id": "\(id)"]) { context in
             var state = try await self._getPodState(id: id)
-            let running = state.client
+            var running = state.client
+
+            // The machine stops itself once its last container is gone, and
+            // the service that ran it lingers with nothing to run. A pod that
+            // offered that machine would be offering one that is not there,
+            // so the client is believed only while its machine answers
+            // running; otherwise the service is taken down and the pod boots
+            // a fresh machine the way it booted the first.
+            if let held = running, (try? await held.state())?.status != .running {
+                await self.deregister(id: id)
+                state.client = nil
+                state.state = .notReady
+                state.startedDate = nil
+                await self.setPodState(id, state, context: context)
+                running = nil
+            }
 
             do {
                 let client: RuntimeClient

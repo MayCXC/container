@@ -958,12 +958,20 @@ public actor RuntimeService {
                 self.log.error("failed to clean up container", metadata: ["error": "\(error)"])
             }
 
-            // A machine holding other containers keeps running for them; it
-            // stops when the last container in it is gone.
+            // A pod's machine is its sandbox, which outlives the containers
+            // that come and go in it: it holds the addresses and namespaces
+            // they share and is taken down when the pod is, not when a
+            // container in it leaves. A single container's machine is the
+            // container's own, so it stops with the last thing in it.
+            // https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
+            let sandbox = try await self.getSandbox()
+            guard !(sandbox is LinuxPod) else {
+                return
+            }
             guard await self.containers.isEmpty else {
                 return
             }
-            try? await self.getSandbox().stop()
+            try? await sandbox.stop()
             await setState(.stopped)
         }
     }
@@ -1638,6 +1646,8 @@ public actor RuntimeService {
         }
 
         self.containers.removeValue(forKey: id)
+        self.processes.removeValue(forKey: id)
+        await self.monitor.stopTracking(id: id)
 
         // The forwarders and the network sessions are the machine's, which the
         // sandbox's containers share, so they are given up once the last of
@@ -1651,6 +1661,10 @@ public actor RuntimeService {
 
         let status = exitStatus ?? ExitStatus(exitCode: 255)
         self.releaseWaiters(for: id, status: status)
+        // The waiter's name is given back with the container's: whoever was
+        // waiting has been answered, and the next container under this name
+        // registers a waiter of its own.
+        self.waiters.removeValue(forKey: id)
     }
 }
 

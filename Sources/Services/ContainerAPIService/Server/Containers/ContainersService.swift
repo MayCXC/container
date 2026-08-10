@@ -152,11 +152,17 @@ public actor ContainersService {
                     ),
                 )
                 results[config.id] = state
-                guard runtimePlugins.first(where: { $0.name == config.runtimeHandler }) != nil else {
-                    throw ContainerizationError(
-                        .internalError,
-                        message: "failed to find runtime plugin \(config.runtimeHandler)"
-                    )
+                // A missing plugin says nothing about the container: the
+                // loader's answer varies with how this process was spawned,
+                // and a bundle outlives any one spawn. Removal is reserved
+                // for a bundle that cannot be read at all.
+                if runtimePlugins.first(where: { $0.name == config.runtimeHandler }) == nil {
+                    log.warning(
+                        "no runtime plugin for container",
+                        metadata: [
+                            "id": "\(config.id)",
+                            "runtime": "\(config.runtimeHandler)",
+                        ])
                 }
             } catch {
                 try? FileManager.default.removeItem(at: dir)
@@ -649,6 +655,10 @@ public actor ContainersService {
                 }
                 do {
                     let log = self.log
+                    try await self.exitMonitor.registerProcess(
+                        id: id,
+                        onExit: self.handleContainerExit
+                    )
                     let waitFunc: ExitMonitor.WaitHandler = {
                         let code = try await client.wait(id)
                         log.info(
