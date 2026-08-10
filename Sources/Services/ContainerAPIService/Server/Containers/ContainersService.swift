@@ -679,7 +679,30 @@ public actor ContainersService {
         }
     }
 
-    /// Send a signal to the container.
+    /// Trim a container's root filesystem; answers the allocation of the file
+    /// backing it before and after the discard.
+    public func trim(id: String) async throws -> (allocatedBefore: UInt64, allocatedAfter: UInt64) {
+        log.debug(
+            "ContainersService: enter",
+            metadata: [
+                "func": "\(#function)",
+                "id": "\(id)",
+            ]
+        )
+        defer {
+            log.debug(
+                "ContainersService: exit",
+                metadata: [
+                    "func": "\(#function)",
+                    "id": "\(id)",
+                ]
+            )
+        }
+
+        let client = try await self.client(for: id)
+        return try await client.trim(id)
+    }
+
     public func kill(id: String, processID: String, signal: String) async throws {
         log.debug(
             "ContainersService: enter",
