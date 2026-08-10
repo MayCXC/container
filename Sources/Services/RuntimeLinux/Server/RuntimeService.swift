@@ -1627,6 +1627,16 @@ public actor RuntimeService {
             self.log.error("failed to stop container during cleanup", metadata: ["error": "\(error)"])
         }
 
+        // The machine keeps a stopped container's place until it is given
+        // back. The registry below forgets the name, so the machine must give
+        // it up too, or the next placement under it is refused against a
+        // place nothing holds.
+        do {
+            try await self.getSandbox().removeContainer(id)
+        } catch {
+            self.log.error("failed to remove container during cleanup", metadata: ["error": "\(error)"])
+        }
+
         self.containers.removeValue(forKey: id)
 
         // The forwarders and the network sessions are the machine's, which the
