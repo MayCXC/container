@@ -25,7 +25,7 @@ import Testing
 @Suite(.serialized)
 struct TestCLIContainersServiceRestartSerial {
     /// The launchd service the containers service runs in.
-    private static let containersService = "com.apple.container.apiserver"
+    private static let containersService = "com.apple.container.container-core-containers"
 
     /// A container still running when the containers service restarts is
     /// adopted by the one that comes up, one run to be removed on exit
