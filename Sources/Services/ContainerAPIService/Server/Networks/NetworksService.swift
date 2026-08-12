@@ -47,6 +47,12 @@ public actor NetworksService {
     private let stateLock = AsyncLock()
     private var serviceStates = [String: NetworkEntry]()
 
+    private weak var containersService: ContainersService?
+
+    public func setContainersService(_ service: ContainersService) async {
+        self.containersService = service
+    }
+
     public init(
         pluginLoader: PluginLoader,
         resourceRoot: FilePath,
@@ -292,15 +298,24 @@ public actor NetworksService {
     ///
     /// - Parameter hostname: A canonical DNS hostname with a trailing dot (e.g. `"example.com."`).
     public func lookup(hostname: String) async throws -> Attachment? {
-        try await self.stateLock.withLock { _ in
+        let allocation = try await self.stateLock.withLock { _ in
             for state in await self.serviceStates.values {
                 guard let allocation = try await state.client.lookup(hostname: hostname) else {
                     continue
                 }
-                return allocation
+                return allocation as Attachment?
             }
             return nil
         }
+        if let allocation {
+            return allocation
+        }
+        // A container in a pod holds no allocation of its own: the pod claims
+        // the address and every container in it shares what was claimed. The
+        // name such a container answers to is on the container, not on any
+        // network, so the containers service is asked once no network holds
+        // the name.
+        return try await self.containersService?.attachment(forHostname: hostname)
     }
 
     public func plugin(for id: String) throws -> String {

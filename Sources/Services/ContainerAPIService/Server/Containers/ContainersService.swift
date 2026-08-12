@@ -281,6 +281,26 @@ public actor ContainersService {
         }
     }
 
+    /// The attachment a hostname answers to when it names a container in a
+    /// pod, gathered inside the containers lock. A container in a pod holds
+    /// no allocation of its own: the pod claims the address and every
+    /// container in it shares what was claimed. The name such a container
+    /// answers to is on its configuration, and the address is on its snapshot
+    /// while the machine runs, in the order its configuration names the
+    /// networks.
+    public func attachment(forHostname hostname: String) async throws -> Attachment? {
+        try await withContainerList(logMetadata: ["acquirer": "\(#function)", "hostname": "\(hostname)"]) { containers in
+            for container in containers {
+                for (index, attachmentConfiguration) in container.configuration.networks.enumerated() {
+                    guard attachmentConfiguration.options.hostname == hostname else { continue }
+                    guard index < container.networks.count else { continue }
+                    return container.networks[index]
+                }
+            }
+            return nil
+        }
+    }
+
     /// Calculate disk usage for containers
     public func calculateDiskUsage() async -> ResourceUsage {
         await lock.withLock(logMetadata: ["acquirer": "\(#function)"]) { _ in

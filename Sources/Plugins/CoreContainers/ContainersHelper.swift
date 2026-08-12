@@ -101,6 +101,7 @@ extension ContainersHelper {
                 await containersService.setPodsService(podsService)
                 await containersService.setNetworksService(networksService)
                 await podsService.setNetworksService(networksService)
+                await networksService.setContainersService(containersService)
 
                 // Machines outlive the process that made them, so before
                 // serving, adopt the ones still running: pods dial their
