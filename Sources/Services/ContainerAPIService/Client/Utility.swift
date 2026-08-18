@@ -85,6 +85,55 @@ public struct Utility {
         )
         let scheme = try RequestScheme(registry.scheme)
 
+        // Naming a pod joins one that is already there, so it has to be there,
+        // and joining it is joining its machine: what the machine is (Rosetta,
+        // nested virtualization, the kernel and its arguments, the init image)
+        // and how it is reached (its network, published ports, DNS) were the
+        // pod's to have been given, and asking for them here is asking the pod
+        // to be something it already is. Each is refused by name rather than
+        // accepted and ignored, which is how nerdctl answers a container joining
+        // another's network. The name a container answers to travels inside its
+        // attachment, so --hostname is covered by --network. The refusal comes
+        // before anything is fetched for the container, since a kernel or init
+        // image it names would otherwise be resolved and then not used.
+        // https://github.com/containerd/nerdctl/blob/main/pkg/containerutil/container_network_manager.go
+        if let named = management.pod {
+            guard let pod = try? await ClientPod.inspect(named) else {
+                throw ContainerizationError(.notFound, message: "pod \(named) does not exist")
+            }
+            var held: [String] = []
+            if management.rosetta { held.append("--rosetta") }
+            if management.virtualization { held.append("--virtualization") }
+            if management.kernel != nil { held.append("--kernel") }
+            if !management.kernelArgs.isEmpty { held.append("--kernel-arg") }
+            if management.initImage != nil { held.append("--init-image") }
+            if !management.publishPorts.isEmpty { held.append("-p/--publish") }
+            if !management.dns.nameservers.isEmpty || management.dns.domain != nil
+                || !management.dns.searchDomains.isEmpty || !management.dns.options.isEmpty
+            {
+                held.append("--dns")
+            }
+            if !management.networks.isEmpty { held.append("--network") }
+            guard held.isEmpty else {
+                throw ContainerizationError(
+                    .invalidArgument,
+                    message:
+                        "these belong to the pod whose machine the container runs in, so they are not the container's to ask for: \(held.joined(separator: ", "))"
+                )
+            }
+
+            // Running a foreign architecture is the machine's to do, and the
+            // machine was booted with or without it before this container
+            // existed, so a container that needs it says so rather than
+            // starting in a machine that cannot run it.
+            if Platform.current.architecture == "arm64", requestedPlatform.architecture == "amd64", !pod.configuration.rosetta {
+                throw ContainerizationError(
+                    .invalidArgument,
+                    message: "pod \(named) runs a machine without Rosetta, which \(requestedPlatform.description) needs; create the pod with --rosetta"
+                )
+            }
+        }
+
         await progressUpdate([
             .setDescription("Fetching image"),
             .setItemsName("blobs"),
@@ -261,35 +310,6 @@ public struct Utility {
         // without one.
         // https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
         config.pod = management.pod ?? PodConfiguration.generateId()
-
-        // Naming a pod joins one that is already there, so it has to be there,
-        // and joining it is joining its network: how that network is reached is
-        // the pod's to have been given, and asking for it here is asking the pod
-        // to be something it already is. Both are refused rather than accepted
-        // and ignored, which is how nerdctl answers a container joining
-        // another's network. The name a container answers to travels inside its
-        // attachment, so --hostname is covered by --network.
-        // https://github.com/containerd/nerdctl/blob/main/pkg/containerutil/container_network_manager.go
-        if let named = management.pod {
-            guard (try? await ClientPod.inspect(named)) != nil else {
-                throw ContainerizationError(.notFound, message: "pod \(named) does not exist")
-            }
-            var held: [String] = []
-            if !management.publishPorts.isEmpty { held.append("-p/--publish") }
-            if !management.dns.nameservers.isEmpty || management.dns.domain != nil
-                || !management.dns.searchDomains.isEmpty || !management.dns.options.isEmpty
-            {
-                held.append("--dns")
-            }
-            if !management.networks.isEmpty { held.append("--network") }
-            guard held.isEmpty else {
-                throw ContainerizationError(
-                    .invalidArgument,
-                    message:
-                        "these belong to the pod whose network the container joins, so they are not the container's to ask for: \(held.joined(separator: ", "))"
-                )
-            }
-        }
 
         config.publishedPorts = try Parser.publishPorts(management.publishPorts)
         guard config.publishedPorts.count <= publishedPortCountLimit else {
