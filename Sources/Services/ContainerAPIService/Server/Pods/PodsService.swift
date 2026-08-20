@@ -222,21 +222,66 @@ public actor PodsService {
         try self._getPodState(id: id).getClient()
     }
 
-    /// The initial filesystem a pod's machine boots, which holds the agent.
-    private func getInitBlock(for platform: Platform, imageRef: String? = nil) async throws -> Filesystem {
+    /// The initial filesystem a pod's machine boots, which holds the agent,
+    /// and the image it was taken from.
+    private func getInitBlock(for platform: Platform, imageRef: String? = nil) async throws -> (Filesystem, ImageDescription) {
         let ref = imageRef ?? containerSystemConfig.vminit.image
         let initImage = try await ClientImage.fetch(reference: ref, platform: platform, containerSystemConfig: containerSystemConfig)
         var fs = try await initImage.getCreateSnapshot(platform: platform)
         fs.options = ["ro"]
-        return fs
+        return (fs, initImage.description)
+    }
+
+    /// Bring a pod's init filesystem to the image the plane boots, when the
+    /// pod records a different one or none.
+    ///
+    /// The bundle keeps a copy of the init filesystem, taken when the pod was
+    /// made, and every machine the pod boots runs that copy; a plane given a
+    /// new init image since then would boot the pod on the agent it was made
+    /// with. So before a fresh machine boots, the plane's init image is
+    /// resolved again and, when its digest is not the one the pod records,
+    /// the runtime configuration, the bundle's copy and the record are brought
+    /// to it. Only a boot reads the copy, so a running machine is untouched,
+    /// and a pod that records no image is brought to the current one.
+    private func refreshInitImage(of configuration: PodConfiguration, at path: URL) async throws -> PodConfiguration {
+        let runtimeConfig = try RuntimeConfiguration.readRuntimeConfiguration(from: path)
+        let (initialFilesystem, description) = try await self.getInitBlock(for: runtimeConfig.kernel.platform.ociPlatform())
+        guard description.digest != configuration.initImage?.digest else {
+            return configuration
+        }
+        var configuration = configuration
+        configuration.initImage = description
+        try RuntimeConfiguration(
+            path: runtimeConfig.path,
+            initialFilesystem: initialFilesystem,
+            kernel: runtimeConfig.kernel,
+            containerConfiguration: runtimeConfig.containerConfiguration,
+            podConfiguration: configuration,
+            containerRootFilesystem: runtimeConfig.containerRootFilesystem,
+            options: runtimeConfig.options,
+            runtimeData: runtimeConfig.runtimeData
+        ).writeRuntimeConfiguration()
+        let bundle = ContainerResource.Bundle(path: path)
+        if bundle.isPod {
+            try bundle.setInitialFilesystem(cloning: initialFilesystem)
+            try bundle.set(podConfiguration: configuration)
+        }
+        log.info(
+            "pod init image refreshed",
+            metadata: ["id": "\(configuration.id)", "image": "\(description.reference)", "digest": "\(description.digest)"]
+        )
+        return configuration
     }
 
     /// Write down a pod that boots the init image named, or the default one.
     public func create(configuration: PodConfiguration, kernel: Kernel, initImage: String? = nil) async throws {
+        let (initialFilesystem, description) = try await self.getInitBlock(for: kernel.platform.ociPlatform(), imageRef: initImage)
+        var configuration = configuration
+        configuration.initImage = description
         try await self.create(
             configuration: configuration,
             kernel: kernel,
-            initialFilesystem: try await self.getInitBlock(for: kernel.platform.ociPlatform(), imageRef: initImage)
+            initialFilesystem: initialFilesystem
         )
     }
 
@@ -394,6 +439,13 @@ public actor PodsService {
                     client = running
                 } else {
                     let path = await self.path(for: id)
+                    // A fresh machine boots the init filesystem copied into
+                    // the bundle, so the copy is brought to the image the
+                    // plane names today before anything boots it; a pod made
+                    // under an earlier init image would otherwise bring up
+                    // that agent under this plane.
+                    state.configuration = try await self.refreshInitImage(of: state.configuration, at: path)
+                    await self.setPodState(id, state, context: context)
                     let runtime = state.configuration.runtimeHandler
                     guard let plugin = self.runtimePlugins.first(where: { $0.name == runtime }) else {
                         throw ContainerizationError(.notFound, message: "unable to locate runtime plugin \(runtime)")

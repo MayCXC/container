@@ -158,6 +158,24 @@ extension Bundle {
         try write(filename: Self.containerConfigFilename, value: configuration)
     }
 
+    /// Set the configuration of the pod this bundle holds.
+    public func set(podConfiguration: PodConfiguration) throws {
+        try write(filename: Self.podConfigFilename, value: podConfiguration)
+    }
+
+    /// Replace the bundle's copy of the initial filesystem with a copy of
+    /// the one given, which the next machine booted from the bundle runs.
+    public func setInitialFilesystem(cloning fs: Filesystem) throws {
+        guard case .block(let format, _, _) = fs.type, format == "ext4" else {
+            throw ContainerizationError(.invalidArgument, message: "initial filesystem must be an ext4 block, got \(fs.type)")
+        }
+        let target = self.path.appendingPathComponent(Self.initfsFilename)
+        if FileManager.default.fileExists(atPath: target.path) {
+            try FileManager.default.removeItem(at: target)
+        }
+        _ = try fs.clone(to: target.path)
+    }
+
     /// Return the full filepath for a named resource in the Bundle.
     public func filePath(for name: String) -> URL {
         path.appendingPathComponent(name)
