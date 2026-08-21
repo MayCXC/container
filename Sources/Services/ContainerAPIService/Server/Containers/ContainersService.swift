@@ -514,7 +514,8 @@ public actor ContainersService {
         id: String,
         processID: String,
         config: ProcessConfiguration,
-        stdio: [FileHandle?]
+        stdio: [FileHandle?],
+        dynamicEnv: [String: String] = [:]
     ) async throws {
         log.debug(
             "ContainersService: enter",
@@ -539,7 +540,8 @@ public actor ContainersService {
         try await client.createProcess(
             processID,
             config: config,
-            stdio: stdio
+            stdio: stdio,
+            dynamicEnv: dynamicEnv
         )
     }
 
