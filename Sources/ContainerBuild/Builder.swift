@@ -159,6 +159,12 @@ public struct Builder: Sendable {
             return await pipeline.exporterResponse()
         } catch {
             await pipeline.discardGathered()
+            // A handler that fails ends the stream it was serving, and the
+            // call reports the ending: without this, a build says its stream
+            // closed and never says what closed it.
+            if let failure = await pipeline.failure {
+                throw failure
+            }
             throw error
         }
         return await pipeline.exporterResponse()
