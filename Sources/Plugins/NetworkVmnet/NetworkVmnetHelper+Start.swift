@@ -19,11 +19,14 @@ import ContainerLog
 import ContainerNetworkClient
 import ContainerNetworkServer
 import ContainerNetworkVmnetServer
+import ContainerPersistence
 import ContainerPlugin
 import ContainerResource
 import ContainerXPC
 import ContainerizationError
 import ContainerizationExtras
+import ContainerizationOS
+import Darwin
 import Foundation
 import Logging
 
@@ -97,7 +100,22 @@ extension NetworkVmnetHelper {
                     log: log
                 )
                 try await network.start()
-                let service = try await DefaultNetworkService(network: network, log: log)
+                // The addresses this network hands out are written down beside
+                // the network they belong to, the way a host-local allocator
+                // keeps its allocations under a directory of its own.
+                // https://cni.dev/plugins/current/ipam/host-local/
+                let leases = FilesystemAttachmentLeaseStore(
+                    store: try FilesystemEntityStore<AttachmentAllocator.Lease>(
+                        path: PathUtils.BaseConfigPath.appRoot.basePath()
+                            .appending("networks")
+                            .appending(id)
+                            .appending("leases"),
+                        type: "lease",
+                        log: log
+                    ),
+                    log: log
+                )
+                let service = try await DefaultNetworkService(network: network, leases: leases, log: log)
                 let harness = NetworkHarness(service: service)
                 let xpc = XPCServer(
                     identifier: serviceIdentifier,
@@ -109,8 +127,31 @@ extension NetworkVmnetHelper {
                     log: log
                 )
 
+                // What the network holds is given back when this helper is
+                // asked to go away, so the addresses it was given can be
+                // handed out again; a helper that exits still holding them
+                // leaves the range spoken for by nobody.
+                let signals = AsyncSignalHandler.create(notify: [SIGINT, SIGTERM])
+                Task {
+                    for await _ in signals.signals {
+                        log.info("releasing the network before exit")
+                        await network.stop()
+                        Darwin.exit(0)
+                    }
+                }
+
                 log.info("starting XPC server")
-                try await xpc.listen()
+                do {
+                    try await xpc.listen()
+                } catch {
+                    // Whatever ends the wait, the addresses go back: a helper
+                    // that leaves holding them leaves them held by nobody, and
+                    // the next network asking for that range is refused with
+                    // no interface, route, or process to point at.
+                    await network.stop()
+                    throw error
+                }
+                await network.stop()
             } catch {
                 log.error(
                     "helper failed",

@@ -36,7 +36,7 @@ public actor NetworksService {
 
     private let pluginLoader: PluginLoader
     private let resourceRoot: FilePath
-    private let containersService: ContainersService
+    private let containers = ContainerClient()
     private let log: Logger
     private let debugHelpers: Bool
 
@@ -50,18 +50,15 @@ public actor NetworksService {
     public init(
         pluginLoader: PluginLoader,
         resourceRoot: FilePath,
-        containersService: ContainersService,
         defaultNetworkConfiguration: NetworkConfiguration,
         log: Logger,
         debugHelpers: Bool = false,
     ) async throws {
         self.pluginLoader = pluginLoader
         self.resourceRoot = resourceRoot
-        self.containersService = containersService
         self.log = log
         self.debugHelpers = debugHelpers
 
-        try FileManager.default.createDirectory(atPath: resourceRoot.string, withIntermediateDirectories: true)
         self.store = try FilesystemEntityStore<NetworkConfiguration>(
             path: resourceRoot,
             type: "network",
@@ -85,7 +82,20 @@ public actor NetworksService {
             // computed default network configuration from the apiserver to ensure we
             // have the correct default values configured.
             if effectiveConfiguration.id == NetworkClient.defaultNetworkName {
-                effectiveConfiguration = defaultNetworkConfiguration
+                // The address range the network came up on is its own, so it
+                // rides through the refresh and is asked for again: a network
+                // that returns on a different range leaves every guest that
+                // outlived the restart holding an address, a route, and a
+                // resolver belonging to a range that is gone.
+                effectiveConfiguration = try NetworkConfiguration(
+                    name: defaultNetworkConfiguration.name,
+                    mode: defaultNetworkConfiguration.mode,
+                    ipv4Subnet: defaultNetworkConfiguration.ipv4Subnet ?? configuration.ipv4Subnet,
+                    ipv6Subnet: defaultNetworkConfiguration.ipv6Subnet ?? configuration.ipv6Subnet,
+                    labels: defaultNetworkConfiguration.labels,
+                    plugin: defaultNetworkConfiguration.plugin,
+                    options: defaultNetworkConfiguration.options
+                )
                 try await store.update(effectiveConfiguration)
             }
 
@@ -95,9 +105,53 @@ public actor NetworksService {
             // 5 seconds or considerably more from the registration of this first
             // network service to its execution.
             do {
-                try await registerService(configuration: effectiveConfiguration)
+                do {
+                    try await registerService(configuration: effectiveConfiguration)
+                } catch  where effectiveConfiguration.id == NetworkClient.defaultNetworkName && effectiveConfiguration.ipv4Subnet != nil {
+                    // The range the default network asks for is the one it was
+                    // given last time, which is a preference and not a demand:
+                    // a range held by something else, or reserved to a network
+                    // nobody holds any more, would otherwise leave the system
+                    // with no network at all and every call that needs one
+                    // waiting forever. The network comes up on whatever range
+                    // is free and says which range it lost.
+                    log.error(
+                        "the default network could not take the address range it was given; taking another",
+                        metadata: [
+                            "range": "\(effectiveConfiguration.ipv4Subnet?.description ?? "")",
+                            "error": "\(error)",
+                        ])
+                    effectiveConfiguration = try NetworkConfiguration(
+                        name: effectiveConfiguration.name,
+                        mode: effectiveConfiguration.mode,
+                        ipv4Subnet: nil,
+                        ipv6Subnet: effectiveConfiguration.ipv6Subnet,
+                        labels: effectiveConfiguration.labels,
+                        plugin: effectiveConfiguration.plugin,
+                        options: effectiveConfiguration.options
+                    )
+                    try await registerService(configuration: effectiveConfiguration)
+                }
                 let client = try Self.getClient(configuration: effectiveConfiguration)
                 let networkStatus = try await client.status()
+
+                // A network that named no range is given one as it comes up,
+                // and that range is written down as the range it asks for from
+                // then on, so the guests it addresses keep answering to the
+                // same addresses across a restart.
+                if effectiveConfiguration.ipv4Subnet == nil {
+                    effectiveConfiguration = try NetworkConfiguration(
+                        name: effectiveConfiguration.name,
+                        mode: effectiveConfiguration.mode,
+                        ipv4Subnet: networkStatus.ipv4Subnet,
+                        ipv6Subnet: effectiveConfiguration.ipv6Subnet,
+                        labels: effectiveConfiguration.labels,
+                        plugin: effectiveConfiguration.plugin,
+                        options: effectiveConfiguration.options
+                    )
+                    try await store.update(effectiveConfiguration)
+                }
+
                 serviceStates[effectiveConfiguration.id] = NetworkEntry(
                     configuration: effectiveConfiguration,
                     status: networkStatus,
@@ -248,50 +302,41 @@ public actor NetworksService {
                 throw ContainerizationError(.invalidArgument, message: "cannot delete builtin network: \(id)")
             }
 
-            // prevent container operations while we atomically check and delete
-            try await self.containersService.withContainerList(logMetadata: ["acquirer": "\(#function)", "id": "\(id)"]) { containers in
-                // find all containers that refer to the network
-                var referringContainers = Set<String>()
-                for container in containers {
-                    for attachmentConfiguration in container.configuration.networks {
-                        if attachmentConfiguration.network == id {
-                            referringContainers.insert(container.configuration.id)
-                            break
-                        }
-                    }
-                }
+            // A container created after this answer can attach to the network
+            // while it is deleted, the same window image delete accepts against
+            // container create; the attach then fails naming the missing network.
+            let referringContainers = try await self.containers.containersAttachedToNetwork(id)
 
-                // bail if any referring containers
-                guard referringContainers.isEmpty else {
-                    throw ContainerizationError(
-                        .invalidState,
-                        message: "cannot delete subnet \(id) with referring containers: \(referringContainers.joined(separator: ", "))"
-                    )
-                }
+            // bail if any referring containers
+            guard referringContainers.isEmpty else {
+                throw ContainerizationError(
+                    .invalidState,
+                    message: "cannot delete subnet \(id) with referring containers: \(referringContainers.joined(separator: ", "))"
+                )
+            }
 
-                // start network deletion, this is the last place we'll want to throw
-                do {
-                    try await self.deregisterService(configuration: serviceState.configuration)
-                } catch {
-                    self.log.error(
-                        "failed to deregister network service",
-                        metadata: [
-                            "id": "\(id)",
-                            "error": "\(error.localizedDescription)",
-                        ])
-                }
+            // start network deletion, this is the last place we'll want to throw
+            do {
+                try await self.deregisterService(configuration: serviceState.configuration)
+            } catch {
+                self.log.error(
+                    "failed to deregister network service",
+                    metadata: [
+                        "id": "\(id)",
+                        "error": "\(error.localizedDescription)",
+                    ])
+            }
 
-                // deletion is underway, do not throw anything now
-                do {
-                    try await self.store.delete(id)
-                } catch {
-                    self.log.error(
-                        "failed to delete network from configuration store",
-                        metadata: [
-                            "id": "\(id)",
-                            "error": "\(error.localizedDescription)",
-                        ])
-                }
+            // deletion is underway, do not throw anything now
+            do {
+                try await self.store.delete(id)
+            } catch {
+                self.log.error(
+                    "failed to delete network from configuration store",
+                    metadata: [
+                        "id": "\(id)",
+                        "error": "\(error.localizedDescription)",
+                    ])
             }
 
             // having deleted successfully, remove the runtime state

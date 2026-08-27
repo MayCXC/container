@@ -27,7 +27,7 @@ import Foundation
 /// container lifecycle operations. All methods that operate on a specific
 /// container take an `id` parameter.
 public struct ContainerClient: Sendable {
-    private static let serviceIdentifier = "com.apple.container.apiserver"
+    private static let serviceIdentifier = "com.apple.container.core.container-core-containers"
 
     private let xpcClient: XPCClient
 
@@ -77,6 +77,108 @@ public struct ContainerClient: Sendable {
             throw ContainerizationError(
                 .internalError,
                 message: "failed to create container",
+                cause: error
+            )
+        }
+    }
+
+    /// The name of every volume a container mounts.
+    public func volumeNamesInUse() async throws -> Set<String> {
+        do {
+            let request = XPCMessage(route: .containerVolumesInUse)
+            let response = try await xpcSend(message: request)
+            guard let data = response.dataNoCopy(key: .references) else {
+                return []
+            }
+            return try JSONDecoder().decode(Set<String>.self, from: data)
+        } catch let error as ContainerizationError {
+            throw error
+        } catch {
+            throw ContainerizationError(
+                .internalError,
+                message: "failed to list volumes in use",
+                cause: error
+            )
+        }
+    }
+
+    /// The containers that mount the named volume.
+    public func containersReferencingVolume(_ name: String) async throws -> [String] {
+        do {
+            let request = XPCMessage(route: .containerVolumeReferences)
+            request.set(key: .volumeName, value: name)
+            let response = try await xpcSend(message: request)
+            guard let data = response.dataNoCopy(key: .references) else {
+                return []
+            }
+            return try JSONDecoder().decode([String].self, from: data)
+        } catch let error as ContainerizationError {
+            throw error
+        } catch {
+            throw ContainerizationError(
+                .internalError,
+                message: "failed to list containers referencing volume \(name)",
+                cause: error
+            )
+        }
+    }
+
+    /// The containers attached to the named network.
+    public func containersAttachedToNetwork(_ id: String) async throws -> [String] {
+        do {
+            let request = XPCMessage(route: .containerNetworkReferences)
+            request.set(key: .id, value: id)
+            let response = try await xpcSend(message: request)
+            guard let data = response.dataNoCopy(key: .references) else {
+                return []
+            }
+            return try JSONDecoder().decode([String].self, from: data)
+        } catch let error as ContainerizationError {
+            throw error
+        } catch {
+            throw ContainerizationError(
+                .internalError,
+                message: "failed to list containers attached to network \(id)",
+                cause: error
+            )
+        }
+    }
+
+    /// The image references containers hold.
+    public func activeImageReferences() async throws -> Set<String> {
+        do {
+            let request = XPCMessage(route: .containerImageReferences)
+            let response = try await xpcSend(message: request)
+            guard let data = response.dataNoCopy(key: .references) else {
+                return []
+            }
+            return try JSONDecoder().decode(Set<String>.self, from: data)
+        } catch let error as ContainerizationError {
+            throw error
+        } catch {
+            throw ContainerizationError(
+                .internalError,
+                message: "failed to list active image references",
+                cause: error
+            )
+        }
+    }
+
+    /// Disk usage totals for containers.
+    public func calculateDiskUsage() async throws -> ResourceUsage {
+        do {
+            let request = XPCMessage(route: .containerUsageTotals)
+            let response = try await xpcSend(message: request)
+            guard let data = response.dataNoCopy(key: .usageTotals) else {
+                throw ContainerizationError(.internalError, message: "usage totals missing from reply")
+            }
+            return try JSONDecoder().decode(ResourceUsage.self, from: data)
+        } catch let error as ContainerizationError {
+            throw error
+        } catch {
+            throw ContainerizationError(
+                .internalError,
+                message: "failed to calculate container disk usage",
                 cause: error
             )
         }
@@ -227,7 +329,8 @@ public struct ContainerClient: Sendable {
         containerId: String,
         processId: String,
         configuration: ProcessConfiguration,
-        stdio: [FileHandle?]
+        stdio: [FileHandle?],
+        dynamicEnv: [String: String] = [:]
     ) async throws -> ClientProcess {
         do {
             let request = XPCMessage(route: .containerCreateProcess)
@@ -236,6 +339,11 @@ public struct ContainerClient: Sendable {
 
             let data = try JSONEncoder().encode(configuration)
             request.set(key: .processConfig, value: data)
+
+            if !dynamicEnv.isEmpty {
+                let env = try JSONEncoder().encode(dynamicEnv)
+                request.set(key: .dynamicEnv, value: env)
+            }
 
             for (i, h) in stdio.enumerated() {
                 let key: XPCKeys = try {
