@@ -151,10 +151,20 @@ public struct Builder: Sendable {
                 }
             )
         } catch Error.buildComplete {
+            await pipeline.discardGathered()
             self.grpcClient.beginGracefulShutdown()
             self.clientTask.cancel()
             try await group.shutdownGracefully()
             return
+        } catch {
+            await pipeline.discardGathered()
+            // A handler that fails ends the stream it was serving, and the
+            // call reports the ending: without this, a build says its stream
+            // closed and never says what closed it.
+            if let failure = await pipeline.failure {
+                throw failure
+            }
+            throw error
         }
     }
 
@@ -199,7 +209,7 @@ public struct Builder: Sendable {
             }
 
             switch type {
-            case "oci":
+            case "oci", "store":
                 break
             case "tar":
                 if destinationValue == nil {
@@ -267,6 +277,13 @@ public struct Builder: Sendable {
         public let buildID: String
         public let contentStore: ContentStore
         public let buildArgs: [String]
+        public let buildContexts: [String]
+        public let addHosts: [String]
+        public let ulimits: [String]
+        public let hostname: String?
+        public let shmSize: UInt64?
+        public let cgroupParent: String?
+        public let network: String?
         public let secrets: [String: Data]
         public let ssh: String
         public let contextDir: String
@@ -284,11 +301,24 @@ public struct Builder: Sendable {
         public let cacheOut: [String]
         public let pull: Bool
         public let containerSystemConfig: ContainerSystemConfig
+        /// Where the blobs this build exports are gathered before the store
+        /// takes them. They land there rather than in the store itself so
+        /// that the store gains them at the moment it records the image that
+        /// names them, and never holds one that nothing claims.
+        public let ingestDir: URL?
 
         public init(
             buildID: String,
             contentStore: ContentStore,
+            ingestDir: URL? = nil,
             buildArgs: [String],
+            buildContexts: [String],
+            addHosts: [String] = [],
+            ulimits: [String] = [],
+            hostname: String? = nil,
+            shmSize: UInt64? = nil,
+            cgroupParent: String? = nil,
+            network: String? = nil,
             secrets: [String: Data],
             ssh: String,
             contextDir: String,
@@ -309,7 +339,15 @@ public struct Builder: Sendable {
         ) {
             self.buildID = buildID
             self.contentStore = contentStore
+            self.ingestDir = ingestDir
             self.buildArgs = buildArgs
+            self.buildContexts = buildContexts
+            self.addHosts = addHosts
+            self.ulimits = ulimits
+            self.hostname = hostname
+            self.shmSize = shmSize
+            self.cgroupParent = cgroupParent
+            self.network = network
             self.secrets = secrets
             self.ssh = ssh
             self.contextDir = contextDir
@@ -356,6 +394,27 @@ public struct Builder: Sendable {
         for buildArg in config.buildArgs {
             metadata.addString(buildArg, forKey: "build-args")
         }
+        for buildContext in config.buildContexts {
+            metadata.addString(buildContext, forKey: "build-context")
+        }
+        for addHost in config.addHosts {
+            metadata.addString(addHost, forKey: "add-host")
+        }
+        for ulimit in config.ulimits {
+            metadata.addString(ulimit, forKey: "ulimit")
+        }
+        if let hostname = config.hostname {
+            metadata.addString(hostname, forKey: "hostname")
+        }
+        if let shmSize = config.shmSize {
+            metadata.addString(String(shmSize), forKey: "shm-size")
+        }
+        if let cgroupParent = config.cgroupParent {
+            metadata.addString(cgroupParent, forKey: "cgroup-parent")
+        }
+        if let network = config.network {
+            metadata.addString(network, forKey: "network")
+        }
         for (id, data) in config.secrets {
             metadata.addString(id + "=" + data.base64EncodedString(), forKey: "secrets")
         }
@@ -363,6 +422,12 @@ public struct Builder: Sendable {
             metadata.addString("default", forKey: "ssh")
         }
         for output in config.exports {
+            // A store export is the builder's default when it is told nothing:
+            // blobs land in the content store through the session and only the
+            // root digest comes back, so the entry sends no output string.
+            if output.type == "store" {
+                continue
+            }
             metadata.addString(try output.stringValue, forKey: "outputs")
         }
         for cacheIn in config.cacheIn {
