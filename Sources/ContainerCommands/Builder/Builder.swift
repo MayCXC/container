@@ -30,6 +30,7 @@ extension Application {
                 BuilderStatus.self,
                 BuilderDialStdio.self,
                 BuilderStop.self,
+                BuilderPrune.self,
                 BuilderDelete.self,
             ])
 
