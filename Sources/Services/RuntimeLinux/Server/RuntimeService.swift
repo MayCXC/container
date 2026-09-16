@@ -1291,8 +1291,14 @@ public actor RuntimeService {
         // it carries that refusal, while a machine someone named holds no such
         // request and is given the network's resolver, the way it was before
         // it could be asked.
+        // A record asking for the gateway is answered whatever else it names, so
+        // the network's resolver leads and the named ones follow it. Order is
+        // the whole of it: a resolver answering NXDOMAIN has answered, and the
+        // next is never asked, so a container's own names resolve only while the
+        // gateway stands first.
+        let gateway = self.getDefaultNameservers(from: attachments)
         let derived = ContainerConfiguration.DNSConfiguration(
-            nameservers: self.getDefaultNameservers(from: attachments),
+            nameservers: gateway,
             domain: config.dns?.domain,
             searchDomains: config.dns?.searchDomains ?? [],
             options: config.dns?.options ?? []
@@ -1301,7 +1307,20 @@ public actor RuntimeService {
             guard let configured = config.dns else {
                 return config.isAnonymous ? nil : derived
             }
-            return configured.nameservers.isEmpty ? derived : configured
+            switch configured.gateway {
+            case .some(true):
+                return ContainerConfiguration.DNSConfiguration(
+                    nameservers: gateway + configured.nameservers,
+                    domain: configured.domain,
+                    searchDomains: configured.searchDomains,
+                    options: configured.options,
+                    gateway: true
+                )
+            case .some(false):
+                return configured
+            case .none:
+                return configured.nameservers.isEmpty ? derived : configured
+            }
         }()
 
         // One swap area serves the whole pod, which is what makes the pool its
