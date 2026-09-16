@@ -246,7 +246,7 @@ public struct Utility {
                 domain: domain,
                 searchDomains: management.dns.searchDomains,
                 options: management.dns.options,
-                gateway: management.dns.gateway
+                gateway: management.dns.gateway ?? containerSystemConfig.dns.gateway
             )
         }
 
