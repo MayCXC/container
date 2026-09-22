@@ -1313,6 +1313,19 @@ public actor RuntimeService {
         let pod = try LinuxPod(config.id, vmm: vmm, logger: self.log) { podConfig in
             podConfig.cpus = config.resources.cpus
             podConfig.memoryInBytes = config.resources.memoryInBytes
+            // Hand memory the guest frees back to the host: the reclaim loop
+            // watches what the pod's containers hold, keeps the machine at that
+            // plus headroom, and hands the whole machine back the moment the
+            // guest needs it, so a workload's high-water mark does not stay
+            // parked in host swap once it passes. Every workload the runtime
+            // boots is a pod, the builder included, so this one flag covers all.
+            podConfig.proactiveMemoryReclaim = true
+            // Look often: the balloon only reacts on a look, so a long gap
+            // leaves the guest waiting for memory it needs back. A look is a
+            // stat read and a balloon write, cheap enough to run at the cadence
+            // the Cloud Hypervisor backend gets from continuous free-page
+            // reporting, unlike the guest-side compaction Kata paces at minutes.
+            podConfig.memoryReclaimInterval = .seconds(1)
             // The machine is built larger than the pod by what the guest agent
             // takes, so what the pod was given is what its containers have. A
             // caller sizing the machine itself asks for none of that overhead
