@@ -278,6 +278,11 @@ PRESERVE_KERNELS ?= false
 # Override with SCRATCH_ROOT=/your/path on the command line.
 SCRATCH_ROOT ?= $(ROOT_DIR)/.test-scratch
 
+# An editable build's images exist in no registry: init-block builds the
+# init image before the data directory is cleared here, and a locally built
+# builder image is in the same position. The recipe lands the tars from bin/
+# after its own system start, into the store the tests actually see; absent
+# a tar, the runtime pulls its documented default instead.
 define RUN_INTEGRATION
 	@echo Ensuring apiserver stopped before the CLI integration tests...
 	@bin/container system stop && sleep 3 && scripts/ensure-container-stopped.sh
@@ -298,6 +303,14 @@ define RUN_INTEGRATION
 		CLITEST_LOG_ROOT=$(LOG_ROOT) && export CLITEST_LOG_ROOT ; \
 		CLITEST_SCRATCH_ROOT=$(SCRATCH_ROOT) && export CLITEST_SCRATCH_ROOT ; \
 		CONTAINER_CLI_PATH=$(ROOT_DIR)/bin/container && export CONTAINER_CLI_PATH ; \
+		if [ -f bin/init.tar ]; then \
+			echo "==> Loading the built init image" && \
+			bin/container i load -i bin/init.tar ; \
+		fi && \
+		if [ -f bin/builder.tar ]; then \
+			echo "==> Loading the built builder image" && \
+			bin/container i load -i bin/builder.tar ; \
+		fi && \
 		echo "==> Starting warmup tests" && \
 		$(SWIFT) test $(INTEGRATION_SWIFT_EXTRA) -c $(BUILD_CONFIGURATION) $(SWIFT_CONFIGURATION) --filter "$(WARMUP_FILTER)" && \
 		echo "==> Starting $(words $(CONCURRENT_TEST_SUITES)) test suites concurrently (width=$(PARALLEL_WIDTH))" && \
