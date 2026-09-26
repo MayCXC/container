@@ -130,11 +130,18 @@ public struct Flags {
     public struct DNS: ParsableArguments {
         public init() {}
 
-        public init(domain: String?, nameservers: [String], options: [String], searchDomains: [String]) {
+        public init(
+            domain: String?,
+            nameservers: [String],
+            options: [String],
+            searchDomains: [String],
+            gateway: Bool? = nil
+        ) {
             self.domain = domain
             self.nameservers = nameservers
             self.options = options
             self.searchDomains = searchDomains
+            self.gateway = gateway
         }
 
         @Option(
@@ -160,6 +167,16 @@ public struct Flags {
             help: .init("DNS search domains", valueName: "domain")
         )
         public var searchDomains: [String] = []
+
+        /// Whether the network's own resolver stands ahead of the nameservers given.
+        /// Unset leaves the standing rule, which is that a container naming no
+        /// nameserver of its own is given the network's, and naming one replaces it.
+        @Flag(
+            name: .customLong("dns-gateway"),
+            inversion: .prefixedNo,
+            help: "Place the container network's own resolver ahead of any nameservers given"
+        )
+        public var gateway: Bool? = nil
     }
 
     public struct Registry: ParsableArguments {
@@ -418,9 +435,10 @@ public struct Flags {
                     || dns.domain != nil
                     || !dns.options.isEmpty
                     || !dns.searchDomains.isEmpty
+                    || dns.gateway != nil
                 if hasDNSConfig {
                     throw ValidationError(
-                        "`--no-dns` cannot be used with DNS configuration flags (`--dns`, `--dns-domain`, `--dns-option`, `--dns-search`)"
+                        "`--no-dns` cannot be used with DNS configuration flags (`--dns`, `--dns-domain`, `--dns-option`, `--dns-search`, `--dns-gateway`)"
                     )
                 }
             }

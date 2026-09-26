@@ -255,7 +255,8 @@ public struct Utility {
                 nameservers: management.dns.nameservers,
                 domain: domain,
                 searchDomains: management.dns.searchDomains,
-                options: management.dns.options
+                options: management.dns.options,
+                gateway: management.dns.gateway ?? containerSystemConfig.dns.gateway
             )
         }
 
