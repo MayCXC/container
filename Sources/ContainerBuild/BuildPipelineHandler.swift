@@ -75,11 +75,44 @@ protocol BuildPipelineHandler: Sendable {
 /// ```
 public actor BuildPipeline {
     let handlers: [BuildPipelineHandler]
+    /// The handler holding what the build has gathered, kept by its own type
+    /// so the build can drop it when it ends.
+    private let content: BuildRemoteContentProxy
+
+    /// What a handler failed with, kept for the caller.
+    ///
+    /// A handler that throws ends the stream it was serving, and the stream
+    /// ending is what the call reports: the build is told its stream closed
+    /// and not what closed it. The first failure is the one that did, so it is
+    /// held here for the caller to raise in place of the closure.
+    private(set) var failure: Swift.Error?
+
+    private func recordFailure(_ error: Swift.Error) {
+        guard self.failure == nil else {
+            return
+        }
+        self.failure = error
+    }
+
     public init(_ config: Builder.BuildConfig) async throws {
+        // Local named contexts are the `name=/absolute/path` entries; the CLI
+        // resolved every local value to an absolute path when it validated the
+        // flag, so a leading slash is what distinguishes a directory from an
+        // image, git, URL or oci-layout reference here.
+        var namedContexts: [String: URL] = [:]
+        for entry in config.buildContexts {
+            let parts = entry.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2, parts[1].hasPrefix("/") else {
+                continue
+            }
+            namedContexts[String(parts[0])] = URL(filePath: String(parts[1]))
+        }
+        let content = try BuildRemoteContentProxy(config.contentStore, ingestDir: config.ingestDir)
+        self.content = content
         self.handlers =
             [
-                try BuildFSSync(URL(filePath: config.contextDir)),
-                try BuildRemoteContentProxy(config.contentStore),
+                try BuildFSSync(URL(filePath: config.contextDir), namedContexts: namedContexts),
+                content,
                 try BuildImageResolver(
                     config.contentStore,
                     quiet: config.quiet,
@@ -105,11 +138,25 @@ public actor BuildPipeline {
                         continue
                     }
                     try Task.checkCancellation()
-                    try await handler.handle(sender, packet)
+                    do {
+                        try await handler.handle(sender, packet)
+                    } catch {
+                        await self.recordFailure(error)
+                        throw error
+                    }
                     break
                 }
             }
         }
+    }
+
+    /// Lets go of the blobs the build began and never sealed.
+    ///
+    /// The build owns this the way it owns the ingest session it cancels when
+    /// it fails: what was gathered for an image that will not be recorded is
+    /// the build's to drop, and the build's end is when that is known.
+    public func discardGathered() async {
+        await self.content.writes.discardAll()
     }
 
     /// untilFirstError() throws when any one of its submitted tasks fail.
