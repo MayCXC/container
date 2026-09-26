@@ -312,6 +312,42 @@ let package = Package(
             path: "Sources/Plugins/CoreImages",
             exclude: ["config.toml"]
         ),
+        .executableTarget(
+            name: "container-core-containers",
+            dependencies: [
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+                .product(name: "Logging", package: "swift-log"),
+                .product(name: "Containerization", package: "containerization"),
+                .product(name: "SystemPackage", package: "swift-system"),
+                "ContainerAPIClient",
+                "ContainerAPIService",
+                "ContainerLog",
+                "ContainerPersistence",
+                "ContainerPlugin",
+                "ContainerVersion",
+                "ContainerXPC",
+            ],
+            path: "Sources/Plugins/CoreContainers",
+            exclude: ["config.toml"]
+        ),
+        .executableTarget(
+            name: "pod",
+            dependencies: [
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+                "ContainerCommands",
+            ],
+            path: "Sources/Plugins/PodCLI",
+            exclude: ["config.toml"]
+        ),
+        .executableTarget(
+            name: "run",
+            dependencies: [
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+                "ContainerCommands",
+            ],
+            path: "Sources/Plugins/RunCLI",
+            exclude: ["config.toml"]
+        ),
         .target(
             name: "ContainerImagesService",
             dependencies: [

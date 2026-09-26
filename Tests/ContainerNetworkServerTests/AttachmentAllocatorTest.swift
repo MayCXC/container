@@ -14,35 +14,61 @@
 // limitations under the License.
 //===----------------------------------------------------------------------===//
 
+import ContainerizationExtras
+import Foundation
 import Testing
 
 @testable import ContainerNetworkServer
 
-struct AttachmentAllocatorTest {
-    @Test func testAllocateSingleHostname() async throws {
-        let allocator = try AttachmentAllocator(lower: 100, size: 10)
+/// A store that keeps leases the way a file would, so what is written down
+/// can be read back by an allocator that was not there when it was written.
+private actor RememberingStore: AttachmentLeaseStore {
+    private var leases: [String: AttachmentAllocator.Lease] = [:]
 
-        let address = try await allocator.allocate(hostname: "test-host")
+    func load() async -> [AttachmentAllocator.Lease] {
+        Array(leases.values)
+    }
+
+    func save(_ lease: AttachmentAllocator.Lease) async {
+        leases[lease.id] = lease
+    }
+}
+
+struct AttachmentAllocatorTest {
+    /// A hardware address to attach with, different for each host so that a
+    /// remembered one is recognizable.
+    private func mac(_ last: UInt8) -> MACAddress {
+        MACAddress(0xf200_0000_0000 | UInt64(last))
+    }
+
+    private func allocate(_ allocator: AttachmentAllocator, _ hostname: String, _ last: UInt8 = 1) async throws -> UInt32 {
+        try await allocator.allocate(hostname: hostname, macAddress: mac(last)).index
+    }
+
+    @Test func testAllocateSingleHostname() async throws {
+        let allocator = try await AttachmentAllocator(lower: 100, size: 10)
+
+        let address = try await allocate(allocator, "test-host")
 
         #expect(address >= 100)
         #expect(address < 110)
     }
 
     @Test func testAllocateSameHostnameTwice() async throws {
-        let allocator = try AttachmentAllocator(lower: 100, size: 10)
+        let allocator = try await AttachmentAllocator(lower: 100, size: 10)
 
-        let address1 = try await allocator.allocate(hostname: "test-host")
-        let address2 = try await allocator.allocate(hostname: "test-host")
+        let address1 = try await allocate(allocator, "test-host")
+        let address2 = try await allocate(allocator, "test-host")
 
         #expect(address1 == address2)
     }
 
     @Test func testAllocateMultipleHostnames() async throws {
-        let allocator = try AttachmentAllocator(lower: 100, size: 10)
+        let allocator = try await AttachmentAllocator(lower: 100, size: 10)
 
-        let address1 = try await allocator.allocate(hostname: "host1")
-        let address2 = try await allocator.allocate(hostname: "host2")
-        let address3 = try await allocator.allocate(hostname: "host3")
+        let address1 = try await allocate(allocator, "host1")
+        let address2 = try await allocate(allocator, "host2")
+        let address3 = try await allocate(allocator, "host3")
 
         #expect(address1 != address2)
         #expect(address2 != address3)
@@ -50,16 +76,16 @@ struct AttachmentAllocatorTest {
     }
 
     @Test func testLookupAllocatedHostname() async throws {
-        let allocator = try AttachmentAllocator(lower: 100, size: 10)
+        let allocator = try await AttachmentAllocator(lower: 100, size: 10)
 
-        let allocatedAddress = try await allocator.allocate(hostname: "test-host")
+        let allocatedAddress = try await allocate(allocator, "test-host")
         let lookedUpAddress = try await allocator.lookup(hostname: "test-host")
 
         #expect(lookedUpAddress == allocatedAddress)
     }
 
     @Test func testLookupNonExistentHostname() async throws {
-        let allocator = try AttachmentAllocator(lower: 100, size: 10)
+        let allocator = try await AttachmentAllocator(lower: 100, size: 10)
 
         let address = try await allocator.lookup(hostname: "non-existent")
 
@@ -67,9 +93,9 @@ struct AttachmentAllocatorTest {
     }
 
     @Test func testDeallocateAllocatedHostname() async throws {
-        let allocator = try AttachmentAllocator(lower: 100, size: 10)
+        let allocator = try await AttachmentAllocator(lower: 100, size: 10)
 
-        let allocatedAddress = try await allocator.allocate(hostname: "test-host")
+        let allocatedAddress = try await allocate(allocator, "test-host")
         let deallocatedAddress = try await allocator.deallocate(hostname: "test-host")
 
         #expect(deallocatedAddress == allocatedAddress)
@@ -80,56 +106,70 @@ struct AttachmentAllocatorTest {
     }
 
     @Test func testDeallocateNonExistentHostname() async throws {
-        let allocator = try AttachmentAllocator(lower: 100, size: 10)
+        let allocator = try await AttachmentAllocator(lower: 100, size: 10)
 
         let deallocatedAddress = try await allocator.deallocate(hostname: "non-existent")
 
         #expect(deallocatedAddress == nil)
     }
 
-    @Test func testReallocateAfterDeallocation() async throws {
-        let allocator = try AttachmentAllocator(lower: 100, size: 10)
+    @Test func testHostAttachingAgainIsGivenWhatItHad() async throws {
+        let allocator = try await AttachmentAllocator(lower: 100, size: 10)
 
-        let address1 = try await allocator.allocate(hostname: "test-host")
-        let released1 = try await allocator.deallocate(hostname: "test-host")
-        #expect(address1 == released1)
-        let address2 = try await allocator.allocate(hostname: "test-host")
+        let first = try await allocator.allocate(hostname: "test-host", macAddress: mac(7))
+        _ = try await allocator.deallocate(hostname: "test-host")
+        // Another host takes an address in between, so the answer is the one
+        // remembered rather than the one next in line.
+        _ = try await allocate(allocator, "other-host", 8)
+        let again = try await allocator.allocate(hostname: "test-host", macAddress: mac(9))
 
-        // After deallocation, allocating the same hostname should give a new address
-        #expect(address2 >= 100)
-        #expect(address2 < 110)
+        #expect(again.index == first.index)
+        #expect(again.macAddress == first.macAddress)
+    }
+
+    @Test func testWhatAHostWasGivenOutlivesTheAllocator() async throws {
+        let store = RememberingStore()
+
+        let first = try await AttachmentAllocator(lower: 100, size: 10, store: store)
+            .allocate(hostname: "test-host", macAddress: mac(3))
+
+        let second = try await AttachmentAllocator(lower: 100, size: 10, store: store)
+            .allocate(hostname: "test-host", macAddress: mac(4))
+
+        #expect(second.index == first.index)
+        #expect(second.macAddress == first.macAddress)
     }
 
     @Test func testAllocateUntilFull() async throws {
         let size = 5
-        let allocator = try AttachmentAllocator(lower: 100, size: size)
+        let allocator = try await AttachmentAllocator(lower: 100, size: size)
 
         // Allocate up to the limit
         for i in 0..<size {
-            _ = try await allocator.allocate(hostname: "host\(i)")
+            _ = try await allocate(allocator, "host\(i)")
         }
 
         // Attempting to allocate one more should throw
         await #expect(throws: Error.self) {
-            try await allocator.allocate(hostname: "extra-host")
+            try await allocate(allocator, "extra-host")
         }
     }
 
     @Test func testDeallocateAndReallocateDifferentHostname() async throws {
         let size = 3
-        let allocator = try AttachmentAllocator(lower: 100, size: size)
+        let allocator = try await AttachmentAllocator(lower: 100, size: size)
 
         // Fill up the allocator
-        let address1 = try await allocator.allocate(hostname: "host1")
-        let address2 = try await allocator.allocate(hostname: "host2")
-        let address3 = try await allocator.allocate(hostname: "host3")
+        let address1 = try await allocate(allocator, "host1")
+        let address2 = try await allocate(allocator, "host2")
+        let address3 = try await allocate(allocator, "host3")
 
         // Deallocate one
         let released2 = try await allocator.deallocate(hostname: "host2")
         #expect(address2 == released2)
 
         // Should be able to allocate a new hostname now
-        let newAddress = try await allocator.allocate(hostname: "host4")
+        let newAddress = try await allocate(allocator, "host4")
         #expect(newAddress >= 100)
         #expect(newAddress < 103)
 
@@ -144,9 +184,9 @@ struct AttachmentAllocatorTest {
     }
 
     @Test func testMultipleDeallocationsOfSameHostname() async throws {
-        let allocator = try AttachmentAllocator(lower: 100, size: 10)
+        let allocator = try await AttachmentAllocator(lower: 100, size: 10)
 
-        let address = try await allocator.allocate(hostname: "test-host")
+        let address = try await allocate(allocator, "test-host")
 
         let firstDeallocate = try await allocator.deallocate(hostname: "test-host")
         #expect(firstDeallocate == address)

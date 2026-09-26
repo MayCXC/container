@@ -23,9 +23,11 @@ public struct Bundle: Sendable {
     private static let kernelFilename = "kernel.json"
     private static let kernelBinaryFilename = "kernel.bin"
     private static let containerRootFsBlockFilename = "rootfs.ext4"
+    private static let containerSwapBlockFilename = "swap.raw"
     private static let containerRootFsFilename = "rootfs.json"
 
     static let containerConfigFilename = "config.json"
+    static let podConfigFilename = "pod.json"
 
     /// The path to the bundle.
     public let path: URL
@@ -38,8 +40,20 @@ public struct Bundle: Sendable {
         self.path.appendingPathComponent("vminitd.log")
     }
 
+    /// The stable host side of the container's ssh agent forwarding: a
+    /// symlink the relay resolves on every guest connection, so pointing it
+    /// somewhere new hands the guest whichever agent socket it names next.
+    public var sshAuthSocketLink: URL {
+        self.path.appendingPathComponent("ssh-auth.sock.link")
+    }
+
     public var containerRootfsBlock: URL {
         self.path.appendingPathComponent(Self.containerRootFsBlockFilename)
+    }
+
+    /// The raw block file backing the container's swap area, when it has one.
+    public var containerSwapBlock: URL {
+        self.path.appendingPathComponent(Self.containerSwapBlockFilename)
     }
 
     private var containerRootfsConfig: URL {
@@ -75,6 +89,22 @@ public struct Bundle: Sendable {
             try load(path: self.path.appendingPathComponent(Self.containerConfigFilename))
         }
     }
+
+    /// The configuration of the pod this bundle holds, when the bundle is a
+    /// pod's rather than a single container's.
+    public var podConfiguration: PodConfiguration {
+        get throws {
+            try load(path: self.path.appendingPathComponent(Self.podConfigFilename))
+        }
+    }
+
+    /// Whether this bundle holds a pod, whose containers keep bundles of their
+    /// own, rather than a single container.
+    public var isPod: Bool {
+        FileManager.default.fileExists(
+            atPath: self.path.appendingPathComponent(Self.podConfigFilename).path
+        )
+    }
 }
 
 extension Bundle {
@@ -83,6 +113,7 @@ extension Bundle {
         initialFilesystem: Filesystem,
         kernel: Kernel,
         containerConfiguration: ContainerConfiguration? = nil,
+        podConfiguration: PodConfiguration? = nil,
         containerRootFilesystem: Filesystem? = nil,
         options: ContainerCreateOptions? = nil
     ) throws -> Bundle {
@@ -108,6 +139,10 @@ extension Bundle {
         let bundle = Bundle(path: path)
         if let containerConfiguration {
             try bundle.write(filename: Self.containerConfigFilename, value: containerConfiguration)
+        }
+
+        if let podConfiguration {
+            try bundle.write(filename: Self.podConfigFilename, value: podConfiguration)
         }
 
         if let rootFsOverride = options?.rootFsOverride {

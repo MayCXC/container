@@ -49,7 +49,6 @@ extension APIServer {
         var logRoot = LogRoot.path
 
         func run() async throws {
-            let containerSystemConfig: ContainerSystemConfig = try await ConfigurationLoader.load()
             let commandName = APIServer._commandName
             let logPath = logRoot.map { $0.appending(FilePath.Component("\(commandName).log") ?? "unknown") }
             let log = ServiceLogger.bootstrap(category: "APIServer", debug: debug, logPath: logPath)
@@ -64,25 +63,10 @@ extension APIServer {
                 let pluginLoader = try initializePluginLoader(log: log)
 
                 try await initializePlugins(pluginLoader: pluginLoader, log: log, routes: &routes, debug: debug)
-                let containersService = try initializeContainersService(
-                    pluginLoader: pluginLoader,
-                    containerSystemConfig: containerSystemConfig,
-                    log: log,
-                    routes: &routes
-                )
-                let networkService = try await initializeNetworksService(
-                    pluginLoader: pluginLoader,
-                    containersService: containersService,
-                    containerSystemConfig: containerSystemConfig,
-                    log: log,
-                    routes: &routes
-                )
-                await containersService.setNetworksService(networkService)
                 initializeHealthCheckService(log: log, routes: &routes)
                 try initializeKernelService(log: log, routes: &routes)
-                let volumesService = try await initializeVolumeService(containersService: containersService, log: log, routes: &routes)
+                let volumesService = try await initializeVolumeService(log: log, routes: &routes)
                 try initializeDiskUsageService(
-                    containersService: containersService,
                     volumesService: volumesService,
                     log: log,
                     routes: &routes
@@ -109,7 +93,7 @@ extension APIServer {
 
                     // start up host table DNS
                     group.addTask {
-                        let hostsResolver = ContainerDNSHandler(networkService: networkService)
+                        let hostsResolver = ContainerDNSHandler(networks: NetworkClient())
                         let nxDomainResolver = NxDomainResolver()
                         let compositeResolver = CompositeResolver(handlers: [hostsResolver, nxDomainResolver])
                         let hostsQueryValidator = StandardQueryValidator(handler: compositeResolver)
@@ -271,101 +255,14 @@ extension APIServer {
             routes[XPCRoute.getDefaultKernel] = XPCServer.route(harness.getDefaultKernel)
         }
 
-        private func initializeContainersService(
-            pluginLoader: PluginLoader,
-            containerSystemConfig: ContainerSystemConfig,
-            log: Logger,
-            routes: inout [XPCRoute: XPCServer.RouteHandler]
-        ) throws -> ContainersService {
-            log.info("initializing containers service")
-
-            // TODO: Remove when we convert ContainersService to FilePath
-            let appRootURL = URL(fileURLWithPath: appRoot.string)
-            let service = try ContainersService(
-                appRoot: appRootURL,
-                pluginLoader: pluginLoader,
-                containerSystemConfig: containerSystemConfig,
-                log: log,
-                debugHelpers: debug
-            )
-            let harness = ContainersHarness(service: service, log: log)
-
-            routes[XPCRoute.containerList] = XPCServer.route(harness.list)
-            routes[XPCRoute.containerCreate] = XPCServer.route(harness.create)
-            routes[XPCRoute.containerDelete] = XPCServer.route(harness.delete)
-            routes[XPCRoute.containerLogs] = XPCServer.route(harness.logs)
-            routes[XPCRoute.containerBootstrap] = XPCServer.route(harness.bootstrap)
-            routes[XPCRoute.containerDial] = XPCServer.route(harness.dial)
-            routes[XPCRoute.containerStop] = XPCServer.route(harness.stop)
-            routes[XPCRoute.containerStartProcess] = XPCServer.route(harness.startProcess)
-            routes[XPCRoute.containerCreateProcess] = XPCServer.route(harness.createProcess)
-            routes[XPCRoute.containerResize] = XPCServer.route(harness.resize)
-            routes[XPCRoute.containerWait] = XPCServer.route(harness.wait)
-            routes[XPCRoute.containerKill] = XPCServer.route(harness.kill)
-            routes[XPCRoute.containerStats] = XPCServer.route(harness.stats)
-            routes[XPCRoute.containerDiskUsage] = XPCServer.route(harness.diskUsage)
-            routes[XPCRoute.containerCopyIn] = XPCServer.route(harness.copyIn)
-            routes[XPCRoute.containerCopyOut] = XPCServer.route(harness.copyOut)
-            routes[XPCRoute.containerExport] = XPCServer.route(harness.export)
-
-            return service
-        }
-
-        private func initializeNetworksService(
-            pluginLoader: PluginLoader,
-            containersService: ContainersService,
-            containerSystemConfig: ContainerSystemConfig,
-            log: Logger,
-            routes: inout [XPCRoute: XPCServer.RouteHandler]
-        ) async throws -> NetworksService {
-            log.info("initializing networks service")
-
-            let resourceRoot = appRoot.appending(FilePath.Component("networks"))
-            let defaultNetworkConfig = try NetworkConfiguration(
-                name: NetworkClient.defaultNetworkName,
-                mode: .nat,
-                ipv4Subnet: containerSystemConfig.network.subnet,
-                ipv6Subnet: containerSystemConfig.network.subnetv6,
-                labels: try .init([ResourceLabelKeys.role: ResourceRoleValues.builtin]),
-                plugin: "container-network-vmnet"
-            )
-            let service = try await NetworksService(
-                pluginLoader: pluginLoader,
-                resourceRoot: resourceRoot,
-                containersService: containersService,
-                defaultNetworkConfiguration: defaultNetworkConfig,
-                log: log,
-                debugHelpers: debug
-            )
-
-            let defaultNetwork = try await service.list()
-                .filter { $0.isBuiltin }
-                .first
-            if defaultNetwork == nil {
-                // FIXME: default network should be configurable elsewhere
-                _ = try await service.create(configuration: defaultNetworkConfig)
-            }
-
-            let harness = NetworksHarness(service: service, log: log)
-
-            if #available(macOS 26, *) {
-                routes[XPCRoute.networkCreate] = XPCServer.route(harness.create)
-            }
-            routes[XPCRoute.networkList] = XPCServer.route(harness.list)
-            routes[XPCRoute.networkDelete] = XPCServer.route(harness.delete)
-
-            return service
-        }
-
         private func initializeVolumeService(
-            containersService: ContainersService,
             log: Logger,
             routes: inout [XPCRoute: XPCServer.RouteHandler]
         ) async throws -> VolumesService {
             log.info("initializing volume service")
 
             let resourceRoot = appRoot.appending(FilePath.Component("volumes"))
-            let service = try await VolumesService(resourceRoot: resourceRoot, containersService: containersService, log: log)
+            let service = try await VolumesService(resourceRoot: resourceRoot, log: log)
             let harness = VolumesHarness(service: service, log: log)
 
             routes[XPCRoute.volumeCreate] = XPCServer.route(harness.create)
@@ -378,7 +275,6 @@ extension APIServer {
         }
 
         private func initializeDiskUsageService(
-            containersService: ContainersService,
             volumesService: VolumesService,
             log: Logger,
             routes: inout [XPCRoute: XPCServer.RouteHandler]
@@ -386,7 +282,6 @@ extension APIServer {
             log.info("initializing disk usage service")
 
             let service = DiskUsageService(
-                containersService: containersService,
                 volumesService: volumesService,
                 log: log
             )
