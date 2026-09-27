@@ -94,7 +94,8 @@ public struct Builder: Sendable {
     // - Symlinks in build context dir
     // - cache-to, cache-from
     // - output (other than the default OCI image output, e.g., local, tar, Docker)
-    public func build(_ config: BuildConfig) async throws {
+    /// Runs the build and returns the solve's exporter response.
+    public func build(_ config: BuildConfig) async throws -> [String: String] {
         var continuation: AsyncStream<ClientStream>.Continuation?
         let reqStream = AsyncStream<ClientStream> { (cont: AsyncStream<ClientStream>.Continuation) in
             continuation = cont
@@ -151,11 +152,16 @@ public struct Builder: Sendable {
                 }
             )
         } catch Error.buildComplete {
+            await pipeline.discardGathered()
             self.grpcClient.beginGracefulShutdown()
             self.clientTask.cancel()
             try await group.shutdownGracefully()
-            return
+            return await pipeline.exporterResponse()
+        } catch {
+            await pipeline.discardGathered()
+            throw error
         }
+        return await pipeline.exporterResponse()
     }
 
     public struct BuildExport: Sendable {
@@ -199,7 +205,7 @@ public struct Builder: Sendable {
             }
 
             switch type {
-            case "oci":
+            case "oci", "store":
                 break
             case "tar":
                 if destinationValue == nil {
@@ -291,10 +297,16 @@ public struct Builder: Sendable {
         public let cacheOut: [String]
         public let pull: Bool
         public let containerSystemConfig: ContainerSystemConfig
+        /// Where the blobs this build exports are gathered before the store
+        /// takes them. They land there rather than in the store itself so
+        /// that the store gains them at the moment it records the image that
+        /// names them, and never holds one that nothing claims.
+        public let ingestDir: URL?
 
         public init(
             buildID: String,
             contentStore: ContentStore,
+            ingestDir: URL? = nil,
             buildArgs: [String],
             buildContexts: [String],
             addHosts: [String] = [],
@@ -323,6 +335,7 @@ public struct Builder: Sendable {
         ) {
             self.buildID = buildID
             self.contentStore = contentStore
+            self.ingestDir = ingestDir
             self.buildArgs = buildArgs
             self.buildContexts = buildContexts
             self.addHosts = addHosts
@@ -405,6 +418,12 @@ public struct Builder: Sendable {
             metadata.addString("default", forKey: "ssh")
         }
         for output in config.exports {
+            // A store export is the builder's default when it is told nothing:
+            // blobs land in the content store through the session and only the
+            // root digest comes back, so the entry sends no output string.
+            if output.type == "store" {
+                continue
+            }
             metadata.addString(try output.stringValue, forKey: "outputs")
         }
         for cacheIn in config.cacheIn {
