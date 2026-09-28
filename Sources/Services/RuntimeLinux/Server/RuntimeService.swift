@@ -1380,6 +1380,10 @@ public actor RuntimeService {
             memoryInBytes: config.resources.memoryInBytes + VMResources.guestMemoryOverhead
         )
         let pod = try LinuxPod(config.id, vmm: vmm, vm: machine, logger: self.log) { podConfig in
+            // Hold the machine at what its guest needs plus a buffer and give
+            // the rest back to the host. Every workload the runtime boots is a
+            // pod, the builder included, so this one setting covers all of them.
+            podConfig.memoryBalloonPolicy = MemoryBalloonPolicy()
             podConfig.swapLayer = swapLayer
             podConfig.interfaces = interfaces
             podConfig.virtualization = config.virtualization
