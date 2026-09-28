@@ -1318,6 +1318,10 @@ public actor RuntimeService {
         let pod = try LinuxPod(config.id, vmm: vmm, logger: self.log) { podConfig in
             podConfig.cpus = config.resources.cpus
             podConfig.memoryInBytes = config.resources.memoryInBytes
+            // Hold the machine at what its guest needs plus a buffer and give
+            // the rest back to the host. Every workload the runtime boots is a
+            // pod, the builder included, so this one setting covers all of them.
+            podConfig.memoryBalloonPolicy = MemoryBalloonPolicy()
             // The machine is built larger than the pod by what the guest agent
             // takes, so what the pod was given is what its containers have. A
             // caller sizing the machine itself asks for none of that overhead
