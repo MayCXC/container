@@ -68,6 +68,12 @@ extension Application {
         @Flag(name: .long, help: "Enable nested virtualization (requires Apple Silicon M3+ and macOS 15+ and kernel with CONFIG_KVM=y)")
         public var virtualization: Bool = false
 
+        @Flag(
+            name: .long,
+            help: "Run mem-agent to reclaim and compact the guest's memory (requires an init image with mem-agent-srv and a kernel with CONFIG_LRU_GEN=y and CONFIG_PSI=y)"
+        )
+        public var memAgent: Bool = false
+
         @Option(name: .long, help: "Path to a custom kernel binary (e.g. vmlinux).")
         public var kernel: String?
 
@@ -101,6 +107,7 @@ extension Application {
                     "memory": memory,
                     "home-mount": homeMount,
                     "virtualization": virtualization ? "true" : nil,
+                    "mem-agent": memAgent ? "true" : nil,
                     "kernel": resolvedKernel?.string,
                 ].compactMapValues { $0 }
             )

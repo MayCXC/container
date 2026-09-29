@@ -18,6 +18,7 @@ import ArgumentParser
 import ContainerAPIClient
 import ContainerPersistence
 import ContainerResource
+import Containerization
 import ContainerizationError
 import Foundation
 
@@ -51,6 +52,9 @@ extension Application.PodCommand {
 
         @Flag(name: .long, help: "Enable Rosetta in the pod's containers")
         var rosetta: Bool = false
+
+        @Flag(name: .long, help: "Run mem-agent in the pod's machine to reclaim and compact its memory (requires guest support)")
+        var memAgent: Bool = false
 
         @Option(name: .long, help: "Key=value metadata for the pod")
         var label: [String] = []
@@ -105,7 +109,10 @@ extension Application.PodCommand {
                 _ = try await networkClient.get(id: attachmentConfiguration.network)
             }
 
-            let kernel = try await ClientKernel.getDefaultKernel(for: .current)
+            var kernel = try await ClientKernel.getDefaultKernel(for: .current)
+            if memAgent {
+                kernel.commandLine.enableMemoryAgent()
+            }
             try await ClientPod.create(configuration: configuration, kernel: kernel)
             print(name)
         }

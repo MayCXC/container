@@ -87,10 +87,10 @@ public struct Utility {
 
         // Naming a pod joins one that is already there, so it has to be there,
         // and joining it is joining its machine: what the machine is (Rosetta,
-        // nested virtualization, the kernel and its arguments, the init image)
-        // and how it is reached (its network, published ports, DNS) were the
-        // pod's to have been given, and asking for them here is asking the pod
-        // to be something it already is. Each is refused by name rather than
+        // nested virtualization, mem-agent, the kernel and its arguments, the
+        // init image) and how it is reached (its network, published ports,
+        // DNS) were the pod's to have been given, and asking for them here is
+        // asking the pod to be something it already is. Each is refused by name rather than
         // accepted and ignored, which is how nerdctl answers a container joining
         // another's network. The name a container answers to travels inside its
         // attachment, so --hostname is covered by --network. The refusal comes
@@ -104,6 +104,7 @@ public struct Utility {
             var held: [String] = []
             if management.rosetta { held.append("--rosetta") }
             if management.virtualization { held.append("--virtualization") }
+            if management.memAgent { held.append("--mem-agent") }
             if management.kernel != nil { held.append("--kernel") }
             if !management.kernelArgs.isEmpty { held.append("--kernel-arg") }
             if management.initImage != nil { held.append("--init-image") }
@@ -422,6 +423,10 @@ public struct Utility {
         // Persist any user-supplied boot args onto the kernel command line. A key supplied
         // here overrides the runtime's matching built-in default (see RuntimeService.bootstrap).
         kernel.commandLine.kernelArgs.append(contentsOf: management.kernelArgs)
+        // After the user's boot args, since mem-agent needs the psi=1 this sets.
+        if management.memAgent {
+            kernel.commandLine.enableMemoryAgent()
+        }
         return kernel
     }
 
