@@ -38,6 +38,17 @@ struct MachineConfigTests {
         #expect(cleared.virtualization == false)
     }
 
+    @Test func memAgentDefaultsToFalse() throws {
+        #expect(MachineConfig.default.memAgent == false)
+    }
+
+    @Test func withSetsMemAgent() throws {
+        let enabled = try MachineConfig.default.with(["mem-agent": "true"])
+        #expect(enabled.memAgent == true)
+        let cleared = try enabled.with(["mem-agent": "false"])
+        #expect(cleared.memAgent == false)
+    }
+
     @Test func withRejectsBogusBoolean() {
         #expect(throws: ContainerizationError.self) {
             try MachineConfig.default.with(["virtualization": "yes"])
@@ -67,29 +78,33 @@ struct MachineConfigTests {
     }
 
     @Test func decodingMissingFieldsUsesDefaults() throws {
-        // Older boot-config.json files predate virtualization/kernel — they must still load.
+        // Older boot-config.json files predate virtualization/mem-agent/kernel; they must still load.
         let legacy = #"{"cpus":4,"memory":"1gb","homeMount":"rw"}"#
         let data = Data(legacy.utf8)
         let decoded = try JSONDecoder().decode(MachineConfig.self, from: data)
         #expect(decoded.cpus == 4)
         #expect(decoded.virtualization == false)
+        #expect(decoded.memAgent == false)
         #expect(decoded.kernelPath == nil)
     }
 
     @Test func roundTripJSON() throws {
         let config = try MachineConfig.default.with([
             "virtualization": "true",
+            "mem-agent": "true",
             "kernel": "/some/vmlinux",
         ])
         let data = try JSONEncoder().encode(config)
         let decoded = try JSONDecoder().decode(MachineConfig.self, from: data)
         #expect(decoded.virtualization == true)
+        #expect(decoded.memAgent == true)
         #expect(decoded.kernelPath == FilePath("/some/vmlinux"))
     }
 
     @Test func settableKeysIncludeNewFields() {
         let keys = MachineConfig.settableKeys.map(\.key)
         #expect(keys.contains("virtualization"))
+        #expect(keys.contains("mem-agent"))
         #expect(keys.contains("kernel"))
     }
 }

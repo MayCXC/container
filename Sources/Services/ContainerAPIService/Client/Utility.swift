@@ -277,6 +277,7 @@ public struct Utility {
             var held: [String] = []
             if management.rosetta { held.append("--rosetta") }
             if management.virtualization { held.append("--virtualization") }
+            if management.memAgent { held.append("--mem-agent") }
             if !management.publishPorts.isEmpty { held.append("-p/--publish") }
             if !management.dns.nameservers.isEmpty || management.dns.domain != nil
                 || !management.dns.searchDomains.isEmpty || !management.dns.options.isEmpty
@@ -415,6 +416,10 @@ public struct Utility {
         // Persist any user-supplied boot args onto the kernel command line. A key supplied
         // here overrides the runtime's matching built-in default (see RuntimeService.bootstrap).
         kernel.commandLine.kernelArgs.append(contentsOf: management.kernelArgs)
+        // After the user's boot args, since mem-agent needs the psi=1 this sets.
+        if management.memAgent {
+            kernel.commandLine.enableMemoryAgent()
+        }
         return kernel
     }
 

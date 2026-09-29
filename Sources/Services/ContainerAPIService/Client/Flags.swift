@@ -190,6 +190,7 @@ public struct Flags {
             kernelArgs: [String],
             labels: [String],
             maskedPaths: [String],
+            memAgent: Bool = false,
             mounts: [String],
             name: String?,
             networks: [String],
@@ -223,6 +224,7 @@ public struct Flags {
             self.kernelArgs = kernelArgs
             self.labels = labels
             self.maskedPaths = maskedPaths
+            self.memAgent = memAgent
             self.mounts = mounts
             self.name = name
             self.networks = networks
@@ -317,6 +319,12 @@ public struct Flags {
             )
         )
         public var maskedPaths: [String] = []
+
+        @Flag(
+            name: .customLong("mem-agent"),
+            help: "Run mem-agent in the container's machine to reclaim and compact its memory (requires guest support)"
+        )
+        public var memAgent = false
 
         @Option(name: .customLong("mount"), help: "Add a mount to the container (format: type=<>,source=<>,target=<>,readonly)")
         public var mounts: [String] = []

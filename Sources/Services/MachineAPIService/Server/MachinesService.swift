@@ -370,7 +370,7 @@ public actor MachinesService {
             config.resources.cpuOverhead = 0
             config.resources.memoryInBytes = bootConfig.memory.toUInt64(unit: .bytes)
 
-            let kernel: Kernel
+            var kernel: Kernel
             if let kernelPath = bootConfig.kernelPath {
                 let validated = try MachineConfig.validateKernelPath(kernelPath.string)
                 kernel = Kernel(
@@ -379,6 +379,9 @@ public actor MachinesService {
                 )
             } else {
                 kernel = try await ClientKernel.getDefaultKernel(for: .current)
+            }
+            if bootConfig.memAgent {
+                kernel.commandLine.enableMemoryAgent()
             }
 
             var fhs: [FileHandle] = []

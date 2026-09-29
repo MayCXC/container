@@ -58,6 +58,7 @@ container run [<options>] <image> [<arguments> ...]
 *   `-k, --kernel <path>`: Set a custom kernel path
 *   `-l, --label <label>`: Add a key=value label to the container
 *   `--masked-path <path>`: **Experimental.** Hide a path inside the container, in addition to the runtime defaults (or `NONE` to clear prior values and the defaults)
+*   `--mem-agent`: Run mem-agent in the container's machine to reclaim and compact its memory (requires guest support; see [Runtime configuration](runtime-configuration.md#reclaim-and-compact-a-machines-memory-with-mem-agent))
 *   `--mount <mount>`: Add a mount to the container (format: type=<>,source=<>,target=<>,readonly)
 *   `--name <name>`: Use the specified name as the container ID
 *   `--network <network>`: Attach the container to a network (format: `<name>[,mac=XX:XX:XX:XX:XX:XX][,mtu=VALUE]`)
@@ -234,6 +235,7 @@ container create [<options>] <image> [<arguments> ...]
 *   `-k, --kernel <path>`: Set a custom kernel path
 *   `-l, --label <label>`: Add a key=value label to the container
 *   `--masked-path <path>`: **Experimental.** Hide a path inside the container, in addition to the runtime defaults (or `NONE` to clear prior values and the defaults)
+*   `--mem-agent`: Run mem-agent in the container's machine to reclaim and compact its memory (requires guest support; see [Runtime configuration](runtime-configuration.md#reclaim-and-compact-a-machines-memory-with-mem-agent))
 *   `--mount <mount>`: Add a mount to the container (format: type=<>,source=<>,target=<>,readonly)
 *   `--name <name>`: Use the specified name as the container ID
 *   `--network <network>`: Attach the container to a network (format: `<name>[,mac=XX:XX:XX:XX:XX:XX][,mtu=VALUE]`)
@@ -1078,6 +1080,7 @@ container machine create [<options>] <image>
 *   `--memory <memory>`: Memory allocation (e.g., 2G, 8G). Default: half of system memory
 *   `--home-mount <home-mount>`: User's home directory mount option (ro, rw, none). Default: rw
 *   `--virtualization`: Enable nested virtualization. Requires Apple Silicon M3+ and macOS 15+ and kernel with CONFIG_KVM=y.
+*   `--mem-agent`: Run mem-agent to reclaim and compact the guest's memory. Requires an init image with mem-agent-srv and a kernel with CONFIG_LRU_GEN=y and CONFIG_PSI=y.
 *   `--kernel <path>`: Path to a custom kernel binary (e.g. `vmlinux`).
 
 **Management Options**
@@ -1212,6 +1215,7 @@ container machine set [--name <name>] [--debug] <setting> ...
 *   `memory=<size>`: Memory allocation (e.g., 2G, 1G). Default: half of system memory
 *   `home-mount=<string>`: User home directory mount option (ro, rw, none). Default: rw
 *   `virtualization=<bool>`: Enable nested virtualization (`true`|`false`). Requires Apple Silicon M3+ and macOS 15+ and kernel with CONFIG_KVM=y.
+*   `mem-agent=<bool>`: Run mem-agent to reclaim and compact the guest's memory (`true`|`false`). Requires an init image with mem-agent-srv and a kernel with CONFIG_LRU_GEN=y and CONFIG_PSI=y.
 *   `kernel=<path>`: Path to a custom kernel binary. An empty value (`kernel=`) clears the override and falls back to the system default.
 
 **Options**
