@@ -403,98 +403,153 @@ public actor PodsService {
 
         try await self.lock.withLock(logMetadata: ["acquirer": "\(#function)", "id": "\(id)"]) { context in
             var state = try await self._getPodState(id: id)
-            var running = state.client
+            var stoodDown = false
+            while true {
+                var running = state.client
 
-            // A machine can be gone while the service that ran it lingers:
-            // stopped out of band, crashed, or torn down without the pod
-            // hearing of it. A pod that offered that machine would be
-            // offering one that is not there, so the client is believed only
-            // while its machine answers running: an answer of anything else
-            // means the machine is gone, and the service is taken down so
-            // the pod boots a fresh machine the way it booted the first. No
-            // answer at all is the query failing, not the machine standing
-            // down; a fresh machine booted against devices a live one still
-            // holds fails at its attachments, so the start fails on the
-            // query instead and the held client stands.
-            if let held = running {
-                guard let observed = try? await held.state() else {
-                    throw ContainerizationError(
-                        .internalError,
-                        message: "the machine of pod \(id) did not answer a state query")
-                }
-                if observed.status != .running {
-                    await self.deregister(id: id)
-                    state.client = nil
-                    state.state = .notReady
-                    state.startedDate = nil
-                    await self.setPodState(id, state, context: context)
-                    running = nil
-                }
-            }
-
-            do {
-                let client: RuntimeClient
-                var networkBootstrapInfos = [NetworkBootstrapInfo]()
-                if let running {
-                    client = running
-                } else {
-                    let path = await self.path(for: id)
-                    // A fresh machine boots the init filesystem copied into
-                    // the bundle, so the copy is brought to the image the
-                    // plane names today before anything boots it; a pod made
-                    // under an earlier init image would otherwise bring up
-                    // that agent under this plane.
-                    state.configuration = try await self.refreshInitImage(of: state.configuration, at: path)
-                    await self.setPodState(id, state, context: context)
-                    let runtime = state.configuration.runtimeHandler
-                    guard let plugin = self.runtimePlugins.first(where: { $0.name == runtime }) else {
-                        throw ContainerizationError(.notFound, message: "unable to locate runtime plugin \(runtime)")
+                // A machine can be gone while the service that ran it lingers:
+                // stopped out of band, crashed, or torn down without the pod
+                // hearing of it. A pod that offered that machine would be
+                // offering one that is not there, so the client is believed only
+                // while its machine answers running: an answer of anything else
+                // means the machine is gone, and the service is taken down so
+                // the pod boots a fresh machine the way it booted the first. No
+                // answer at all is the query failing, not the machine standing
+                // down; a fresh machine booted against devices a live one still
+                // holds fails at its attachments, so the start fails on the
+                // query instead and the held client stands.
+                //
+                // A machine that answers stopping is on its way out and is left
+                // to finish: its service taken down meanwhile kills it in the
+                // middle of releasing what it holds. It is asked again until it
+                // answers something else.
+                if let held = running {
+                    let observed = try await self.settledState(of: held, pod: id)
+                    if observed.status != .running {
+                        try await self.deregister(id: id)
+                        state.client = nil
+                        state.state = .notReady
+                        state.startedDate = nil
+                        await self.setPodState(id, state, context: context)
+                        running = nil
                     }
-                    try Self.registerService(
-                        plugin: plugin,
-                        loader: self.pluginLoader,
-                        id: id,
-                        path: path,
-                        debug: self.debugHelpers,
-                        domain: self.launchdDomainString
+                }
+
+                do {
+                    let client: RuntimeClient
+                    var networkBootstrapInfos = [NetworkBootstrapInfo]()
+                    if let running {
+                        client = running
+                    } else {
+                        let path = await self.path(for: id)
+                        // A fresh machine boots the init filesystem copied
+                        // into the bundle, so the copy is brought to the
+                        // image the plane names today before anything boots
+                        // it; a pod made under an earlier init image would
+                        // otherwise bring up that agent under this plane.
+                        state.configuration = try await self.refreshInitImage(of: state.configuration, at: path)
+                        await self.setPodState(id, state, context: context)
+                        let runtime = state.configuration.runtimeHandler
+                        guard let plugin = self.runtimePlugins.first(where: { $0.name == runtime }) else {
+                            throw ContainerizationError(.notFound, message: "unable to locate runtime plugin \(runtime)")
+                        }
+                        try Self.registerService(
+                            plugin: plugin,
+                            loader: self.pluginLoader,
+                            id: id,
+                            path: path,
+                            debug: self.debugHelpers,
+                            domain: self.launchdDomainString
+                        )
+
+                        // The pod claims its addresses, which every container placed
+                        // in it shares, having no network namespace of its own.
+                        for n in state.configuration.networks {
+                            guard let plugin = try await self.networksService?.plugin(for: n.network) else {
+                                throw ContainerizationError(.internalError, message: "failed to get plugin for network \(n.network)")
+                            }
+                            networkBootstrapInfos.append(NetworkBootstrapInfo(plugin: plugin))
+                        }
+                        client = try await RuntimeClient.create(id: id, runtime: runtime)
+                    }
+
+                    // The pod is asked to run holding its containers, which is one
+                    // request whether it is coming up around them or already up and
+                    // taking in the one that is new to it.
+                    try await client.bootstrap(
+                        bundlePaths: try await self.bundlePaths(of: id),
+                        stdioFor: container,
+                        stdio: startup?.stdio ?? [nil, nil, nil],
+                        networkBootstrapInfos: networkBootstrapInfos,
+                        dynamicEnv: startup?.dynamicEnv ?? [:],
+                        stopsWithContainers: state.configuration.isAnonymous
                     )
 
-                    // The pod claims its addresses, which every container placed
-                    // in it shares, having no network namespace of its own.
-                    for n in state.configuration.networks {
-                        guard let plugin = try await self.networksService?.plugin(for: n.network) else {
-                            throw ContainerizationError(.internalError, message: "failed to get plugin for network \(n.network)")
-                        }
-                        networkBootstrapInfos.append(NetworkBootstrapInfo(plugin: plugin))
+                    if running == nil {
+                        state.client = client
+                        state.state = .ready
+                        state.startedDate = Date()
+                        await self.setPodState(id, state, context: context)
                     }
-                    client = try await RuntimeClient.create(id: id, runtime: runtime)
+                    return
+                } catch {
+                    if running == nil {
+                        try? await self.deregister(id: id)
+                        throw error
+                    }
+                    // The machine answered running a moment ago and refuses the
+                    // container now: it stood down in between, and a refusal is
+                    // its own word on that, the positive verdict a fresh boot
+                    // waits for. It is asked once more, which finds it stopping
+                    // or stopped and retires it, and the pod boots a fresh
+                    // machine; a second refusal is an error.
+                    guard !stoodDown, Self.standsDown(error) else {
+                        throw error
+                    }
+                    stoodDown = true
                 }
-
-                // The pod is asked to run holding its containers, which is one
-                // request whether it is coming up around them or already up and
-                // taking in the one that is new to it.
-                try await client.bootstrap(
-                    bundlePaths: try await self.bundlePaths(of: id),
-                    stdioFor: container,
-                    stdio: startup?.stdio ?? [nil, nil, nil],
-                    networkBootstrapInfos: networkBootstrapInfos,
-                    dynamicEnv: startup?.dynamicEnv ?? [:],
-                    stopsWithContainers: state.configuration.isAnonymous
-                )
-
-                if running == nil {
-                    state.client = client
-                    state.state = .ready
-                    state.startedDate = Date()
-                    await self.setPodState(id, state, context: context)
-                }
-            } catch {
-                if running == nil {
-                    await self.deregister(id: id)
-                }
-                throw error
             }
         }
+    }
+
+    /// How long a machine on its way down is given to finish.
+    static let standDownTimeout: Duration = .seconds(60)
+
+    /// What a held machine says of itself once it is not stopping, asked
+    /// again while it is. No answer is the query failing, which the caller
+    /// treats as it treats any failed query, rather than the machine
+    /// standing down.
+    private func settledState(of client: RuntimeClient, pod id: String) async throws -> SandboxSnapshot {
+        let deadline = ContinuousClock.now + Self.standDownTimeout
+        while true {
+            guard let observed = try? await client.state() else {
+                throw ContainerizationError(
+                    .internalError,
+                    message: "the machine of pod \(id) did not answer a state query")
+            }
+            guard observed.status == .stopping else {
+                return observed
+            }
+            guard ContinuousClock.now < deadline else {
+                throw ContainerizationError(
+                    .invalidState,
+                    message: "the machine of pod \(id) is still stopping after \(Self.standDownTimeout)")
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+    }
+
+    /// Whether a running machine's refusal of a container is the machine
+    /// standing down: the runtime refuses to place a container in a machine
+    /// that is stopping or stopped, as an invalid state, and that reaches the
+    /// pod as the cause of the failed bootstrap.
+    private static func standsDown(_ error: any Error) -> Bool {
+        guard let failed = error as? ContainerizationError,
+            let cause = failed.cause as? ContainerizationError
+        else {
+            return false
+        }
+        return cause.code == .invalidState
     }
 
     /// Stop a pod's machine, and with it every container inside.
@@ -510,7 +565,7 @@ public actor PodsService {
 
             try? await client.stop(options: options)
             try? await client.shutdown()
-            await self.deregister(id: id)
+            try await self.deregister(id: id)
 
             state.client = nil
             state.state = .notReady
@@ -684,11 +739,15 @@ public actor PodsService {
         )
     }
 
-    private func deregister(id: String) async {
+    /// Take a pod's service out of launchd, and wait until it is gone: a
+    /// service registered under the same label meanwhile would be the old
+    /// one, still being torn down, and the pod's next machine would be
+    /// looked for in a process on its way out.
+    private func deregister(id: String) async throws {
         let runtime = (try? self._getPodState(id: id).configuration.runtimeHandler) ?? Self.runtimeHandler
         let label = Self.fullLaunchdServiceLabel(
             domain: self.launchdDomainString, runtimeName: runtime, instanceId: id)
-        try? ServiceManager.deregister(fullServiceLabel: label)
+        try await ServiceManager.deregisterAndWait(fullServiceLabel: label)
     }
 
     private func setPodState(_ id: String, _ state: PodState, context: AsyncLock.Context) async {
