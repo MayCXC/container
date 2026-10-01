@@ -185,18 +185,8 @@ extension Application {
                     if imageChanged || cpuChanged || memChanged || envChanged || dnsChanged || sshChanged {
                         try? await client.delete(id: existingContainer.id)
                     } else {
-                        do {
-                            try await startBuildKit(client: client, id: existingContainer.id, progressUpdate, nil)
-                            return
-                        } catch {
-                            log.warning(
-                                "failed to restart existing stopped BuildKit container, recreating it",
-                                metadata: [
-                                    "id": "\(existingContainer.id)",
-                                    "error": "\(error)",
-                                ])
-                        }
-                        try? await client.delete(id: existingContainer.id)
+                        try await startBuildKit(client: client, id: existingContainer.id, progressUpdate, nil, created: false)
+                        return
                     }
                 case .stopping:
                     throw ContainerizationError(
@@ -320,7 +310,7 @@ extension Application {
                 // idempotent, so just proceed against the container the winner created.
             }
 
-            try await startBuildKit(client: client, id: Builder.builderContainerId, progressUpdate, taskManager)
+            try await startBuildKit(client: client, id: Builder.builderContainerId, progressUpdate, taskManager, created: true)
             log.debug("starting BuildKit and BuildKit-shim")
         }
     }
@@ -330,11 +320,18 @@ extension Application {
 
 /// Starts the BuildKit process within the container
 /// This function handles bootstrapping the container and starting the BuildKit process
+///
+/// A builder this call created holds nothing yet, so a start that fails deletes
+/// it and the next start begins over. An existing builder's storage is the
+/// build cache, which a restart that fails leaves in place: the failure is
+/// reported, and `container builder delete` is how a builder that will not
+/// start again is given up.
 private func startBuildKit(
     client: ContainerClient,
     id: String,
     _ progress: @escaping ProgressUpdateHandler,
-    _ taskManager: ProgressTaskCoordinator? = nil
+    _ taskManager: ProgressTaskCoordinator? = nil,
+    created: Bool
 ) async throws {
     do {
         let io = try ProcessIO.create(
@@ -354,6 +351,13 @@ private func startBuildKit(
         await taskManager?.finish()
         try io.closeAfterStart()
     } catch {
+        guard created else {
+            throw ContainerizationError(
+                .internalError,
+                message: "failed to restart the stopped builder \(id); its storage holds the build cache, and `container builder delete` discards it",
+                cause: error
+            )
+        }
         try? await client.stop(id: id)
         try? await client.delete(id: id)
         if error is ContainerizationError {
