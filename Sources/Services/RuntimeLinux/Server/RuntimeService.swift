@@ -991,6 +991,11 @@ public actor RuntimeService {
             guard await self.containers.isEmpty else {
                 return
             }
+            // The machine is on its way down from here and says so to whoever
+            // asks meanwhile, as the stop route does, so that a start arriving
+            // during the teardown waits for its end rather than reading a
+            // running machine that is gone by the time its request lands.
+            await setState(.stopping)
             try? await sandbox.stop()
             await setState(.stopped)
         }
