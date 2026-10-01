@@ -158,17 +158,34 @@ public struct ContainerConfiguration: Sendable, Codable {
         public let domain: String?
         public let searchDomains: [String]
         public let options: [String]
+        /// Whether the network's own resolver stands ahead of `nameservers`.
+        /// Nothing recorded leaves the standing rule, which gives the network's
+        /// resolver to a container naming none of its own and replaces it for a
+        /// container that names one. A record here answers the question the rule
+        /// was standing in for, so a container may have both.
+        public let gateway: Bool?
 
         public init(
             nameservers: [String] = defaultNameservers,
             domain: String? = nil,
             searchDomains: [String] = [],
-            options: [String] = []
+            options: [String] = [],
+            gateway: Bool? = nil
         ) {
             self.nameservers = nameservers
             self.domain = domain
             self.searchDomains = searchDomains
             self.options = options
+            self.gateway = gateway
+        }
+
+        public init(from decoder: any Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.nameservers = try c.decodeIfPresent([String].self, forKey: .nameservers) ?? []
+            self.domain = try c.decodeIfPresent(String.self, forKey: .domain)
+            self.searchDomains = try c.decodeIfPresent([String].self, forKey: .searchDomains) ?? []
+            self.options = try c.decodeIfPresent([String].self, forKey: .options) ?? []
+            self.gateway = try c.decodeIfPresent(Bool.self, forKey: .gateway)
         }
     }
 
