@@ -73,6 +73,38 @@ public struct ServiceManager {
         return false
     }
 
+    /// Deregister a service and wait until launchd has let go of the job.
+    ///
+    /// `bootout` returns while the job is still being torn down: for some
+    /// tens of milliseconds after it, `launchctl list` no longer names the
+    /// label while `launchctl print` still describes the job, signalled and
+    /// not yet gone, holding its Mach service port. A definition registered
+    /// under the label meanwhile is taken, but a connection made to the label
+    /// before the old job's port is torn down reaches that port and is
+    /// interrupted when it goes, and the new job never spawns. launchctl
+    /// offers nothing to wait on for the teardown, so the job is asked for
+    /// until `print` no longer finds it, up to the timeout.
+    public static func deregisterAndWait(fullServiceLabel label: String, timeout: Duration = .seconds(30)) async throws {
+        var status: Int32 = 0
+        try Self.deregister(fullServiceLabel: label, status: &status)
+        let deadline = ContinuousClock.now + timeout
+        while try Self.jobExists(fullServiceLabel: label) {
+            guard ContinuousClock.now < deadline else {
+                throw ContainerizationError(
+                    .internalError,
+                    message: "launchd still holds the job \(label) \(timeout) after `launchctl bootout` returned \(status)")
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+    }
+
+    /// Whether launchd still holds a job object for the label, in any state.
+    /// `print` describes the job until launchd has torn it down, where `list`
+    /// names only one that runs or waits to run.
+    private static func jobExists(fullServiceLabel label: String) throws -> Bool {
+        try runLaunchctlCommand(args: ["print", label]) == 0
+    }
+
     /// Restart a service by a launchd label.
     public static func kickstart(fullServiceLabel label: String) throws {
         _ = try runLaunchctlCommand(args: ["kickstart", "-k", label])
