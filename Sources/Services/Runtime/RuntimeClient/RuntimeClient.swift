@@ -102,12 +102,13 @@ public struct RuntimeClient: Sendable {
 
 // Runtime Methods
 extension RuntimeClient {
-    /// Run the sandbox with the containers it holds in it.
+    /// Run the sandbox with the containers named here in it.
     ///
-    /// The sandbox is brought up with every container named here in it, and
-    /// asking again for one already up puts in whichever of them it does not
-    /// hold yet. The standard streams belong to the container named by
-    /// `stdioFor`, the one whose start this is; the rest are placed with none.
+    /// A container's start names itself: the sandbox is brought up around it,
+    /// or, already up, takes it in. A pod's start names none and brings the
+    /// sandbox up empty. The standard streams belong to the container named by
+    /// `stdioFor`, the one whose start this is, which is why a container is
+    /// named only by its own start.
     public func bootstrap(
         bundlePaths: [String],
         stdioFor: String? = nil,

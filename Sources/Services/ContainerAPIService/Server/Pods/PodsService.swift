@@ -377,30 +377,59 @@ public actor PodsService {
         }
     }
 
-    /// Boot a pod's machine and place the containers that belong to it inside.
+    /// Run a pod's machine, and the container whose start this is in it.
     ///
-    /// The containers go in before the machine starts, which is what a machine
-    /// with no way to attach storage while running requires.
-    ///
-    /// A container the caller is starting the pod for brings what the caller
-    /// holds for it. The machine itself is nobody's to read and has no
-    /// environment of its own, so it is bootstrapped with neither.
-    /// The bundles of the containers a pod holds, which its machine runs.
-    private func bundlePaths(of id: String) async throws -> [String] {
-        var paths = [String]()
-        for member in await self.containers(of: id) {
-            guard let path = await self.containersService?.path(for: member.id) else {
-                throw ContainerizationError(.internalError, message: "no container service to place \(member.id)")
-            }
-            paths.append(path.path)
-        }
-        return paths
-    }
-
+    /// A container's start names itself: the machine is booted around it when
+    /// it is down and takes it in when it is up, with the streams and the
+    /// environment the caller holds for it, which belong to the container and
+    /// travel under its id. A pod's own start names no container: the machine
+    /// is booted empty when it is down, and every member not running is then
+    /// started through its own start, one after another, going on past one
+    /// that fails and naming the failed at the end, which is the sandbox
+    /// brought up and its containers started one by one.
+    /// https://github.com/kubernetes/kubernetes/blob/master/pkg/kubelet/kuberuntime/kuberuntime_manager.go
     public func start(id: String, container: String? = nil, startup: ContainerStartup? = nil) async throws {
         log.debug("PodsService: enter", metadata: ["func": "\(#function)", "id": "\(id)"])
         defer { log.debug("PodsService: exit", metadata: ["func": "\(#function)", "id": "\(id)"]) }
 
+        try await self.runMachine(id: id, container: container, startup: startup)
+        guard container == nil else {
+            return
+        }
+        try await self.startMembers(of: id, dynamicEnv: startup?.dynamicEnv ?? [:])
+    }
+
+    /// Start every member of the pod that is not running, each through its own
+    /// start, as its client would. The start that places a member is the one
+    /// that carries its streams, and this one carries none, so each is placed
+    /// with none; a member that fails does not keep the next from starting, and
+    /// the failures are reported together.
+    private func startMembers(of id: String, dynamicEnv: [String: String]) async throws {
+        guard let containersService = self.containersService else {
+            throw ContainerizationError(.internalError, message: "no container service to start the members of pod \(id)")
+        }
+        var failures = [String]()
+        let members = await self.containers(of: id).sorted { $0.id < $1.id }
+        for member in members where member.status != .running && member.status != .stopping {
+            do {
+                try await containersService.bootstrap(id: member.id, stdio: [nil, nil, nil], dynamicEnv: dynamicEnv)
+                try await containersService.startProcess(id: member.id, processID: member.id)
+            } catch {
+                failures.append("\(member.id): \(error)")
+            }
+        }
+        guard failures.isEmpty else {
+            throw ContainerizationError(
+                .internalError,
+                message: "pod \(id): \(failures.count) container(s) did not start: \(failures.joined(separator: "; "))"
+            )
+        }
+    }
+
+    /// The machine up, holding the container named, if any. Held under the
+    /// lock, so a start that boots the machine and one that joins it never
+    /// race for the same machine.
+    private func runMachine(id: String, container: String?, startup: ContainerStartup?) async throws {
         try await self.lock.withLock(logMetadata: ["acquirer": "\(#function)", "id": "\(id)"]) { context in
             var state = try await self._getPodState(id: id)
             var stoodDown = false
@@ -473,11 +502,19 @@ public actor PodsService {
                         client = try await RuntimeClient.create(id: id, runtime: runtime)
                     }
 
-                    // The pod is asked to run holding its containers, which is one
-                    // request whether it is coming up around them or already up and
-                    // taking in the one that is new to it.
+                    // The machine is asked to run holding the container whose
+                    // start this is, which is one request whether it is coming
+                    // up around it or already up and taking it in. A pod's own
+                    // start names none, and the machine comes up empty.
+                    var bundlePaths = [String]()
+                    if let container {
+                        guard let path = await self.containersService?.path(for: container) else {
+                            throw ContainerizationError(.internalError, message: "no container service to place \(container)")
+                        }
+                        bundlePaths = [path.path]
+                    }
                     try await client.bootstrap(
-                        bundlePaths: try await self.bundlePaths(of: id),
+                        bundlePaths: bundlePaths,
                         stdioFor: container,
                         stdio: startup?.stdio ?? [nil, nil, nil],
                         networkBootstrapInfos: networkBootstrapInfos,

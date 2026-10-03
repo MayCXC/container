@@ -286,7 +286,7 @@ public actor RuntimeService {
             default:
                 throw ContainerizationError(
                     .invalidState,
-                    message: "cannot shutdown: container is not stopped"
+                    message: "cannot shutdown: the machine is not stopped"
                 )
             }
 
@@ -417,7 +417,7 @@ public actor RuntimeService {
         defer { self.log.debug("exit", metadata: ["func": "\(#function)"]) }
 
         let stopOptions = try message.stopOptions()
-        let signal = try Signal(stopOptions.signal ?? "SIGTERM")
+        let requested = stopOptions.signal
         let timeout: Duration = .seconds(stopOptions.timeoutInSeconds)
 
         return try await self.lock.withLock { _ in
@@ -427,15 +427,22 @@ public actor RuntimeService {
 
                 let sandbox = try await self.getSandbox()
                 // Every container in the machine is stopped before the machine
-                // itself goes, so each is given its chance to end on its own.
+                // itself goes, all at once, each given its chance to end on
+                // its own with the signal its configuration names unless the
+                // request named one, as a container stopped by itself is.
+                // https://github.com/kubernetes/kubernetes/blob/master/pkg/kubelet/kuberuntime/kuberuntime_container.go
                 var exitStatuses: [String: ExitStatus] = [:]
-                for ctr in await self.sortedContainers() {
-                    exitStatuses[ctr.id] = try await self.gracefulStopContainer(
-                        sandbox,
-                        id: ctr.id,
-                        signal: signal,
-                        timeout: timeout
-                    )
+                try await withThrowingTaskGroup(of: (String, ExitStatus).self) { group in
+                    for ctr in await self.sortedContainers() {
+                        let id = ctr.id
+                        let signal = try Signal(requested ?? ctr.config.stopSignal ?? "SIGTERM")
+                        group.addTask {
+                            (id, try await self.gracefulStopContainer(sandbox, id: id, signal: signal, timeout: timeout))
+                        }
+                    }
+                    for try await (id, status) in group {
+                        exitStatuses[id] = status
+                    }
                 }
                 try await sandbox.stop()
 
@@ -523,7 +530,7 @@ public actor RuntimeService {
             default:
                 throw ContainerizationError(
                     .invalidState,
-                    message: "cannot kill: container is not running"
+                    message: "cannot kill: the machine is not running"
                 )
             }
         }
@@ -873,7 +880,7 @@ public actor RuntimeService {
         guard self.state == .booted || self.state == .running else {
             throw ContainerizationError(
                 .invalidState,
-                message: "container expected to be in booted state, got: \(self.state)"
+                message: "the machine is \(self.state), and a container starts only in a machine that is booted or running"
             )
         }
 
@@ -893,10 +900,41 @@ public actor RuntimeService {
             }
             try await self.monitor.track(id: id, waitingOn: waitFunc)
         } catch {
+            // The failure is this container's: its place is given back and the
+            // machine stays up for its siblings, the way a sandbox stands after
+            // one of its containers fails to start. A machine nobody named
+            // stops with the last thing in it, here as when a container exits.
+            // https://github.com/kubernetes/kubernetes/blob/master/pkg/kubelet/kuberuntime/kuberuntime_manager.go
             try? await self.cleanUpContainer(containerInfo: info)
-            self.setState(.stopped)
+            try? await self.stopMachineIfEmpty()
             throw error
         }
+    }
+
+    /// Stop a machine that exists for its containers once none is left in it.
+    ///
+    /// A pod's machine is its sandbox, which outlives the containers that come
+    /// and go in it: it holds the addresses and namespaces they share and is
+    /// taken down when the pod is, not when a container in it leaves. A machine
+    /// nobody named exists for its one container, so it stops with the last
+    /// thing in it and releases the devices it held; the boot request says
+    /// which kind this machine is. Called with the lock held.
+    /// https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
+    private func stopMachineIfEmpty() async throws {
+        let sandbox = try self.getSandbox()
+        if sandbox is LinuxPod, !self.sandboxStopsWithContainers {
+            return
+        }
+        guard self.containers.isEmpty else {
+            return
+        }
+        // The machine is on its way down from here and says so to whoever
+        // asks meanwhile, as the stop route does, so that a start arriving
+        // during the teardown waits for its end rather than reading a
+        // running machine that is gone by the time its request lands.
+        self.setState(.stopping)
+        try? await sandbox.stop()
+        self.setState(.stopped)
     }
 
     private func startExecProcess(processId id: String, lock: AsyncLock.Context) async throws {
@@ -1033,28 +1071,7 @@ public actor RuntimeService {
                 self.log.error("failed to clean up container", metadata: ["error": "\(error)"])
             }
 
-            // A pod's machine is its sandbox, which outlives the containers
-            // that come and go in it: it holds the addresses and namespaces
-            // they share and is taken down when the pod is, not when a
-            // container in it leaves. A machine nobody named exists for its
-            // one container, so it stops with the last thing in it and
-            // releases the devices it held; the boot request says which
-            // kind this machine is.
-            // https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
-            let sandbox = try await self.getSandbox()
-            if sandbox is LinuxPod, !(await self.sandboxStopsWithContainers) {
-                return
-            }
-            guard await self.containers.isEmpty else {
-                return
-            }
-            // The machine is on its way down from here and says so to whoever
-            // asks meanwhile, as the stop route does, so that a start arriving
-            // during the teardown waits for its end rather than reading a
-            // running machine that is gone by the time its request lands.
-            await setState(.stopping)
-            try? await sandbox.stop()
-            await setState(.stopped)
+            try await self.stopMachineIfEmpty()
         }
     }
 

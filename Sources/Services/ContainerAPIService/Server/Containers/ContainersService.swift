@@ -967,8 +967,9 @@ public actor ContainersService {
             )
             let client = try state.getClient()
             // Removing a container removes that container; the machine it
-            // shares is not this call's to stop, and goes down on its own
-            // once the last container in it has stopped.
+            // shares is not this call's to stop. A machine nobody named goes
+            // down with the last container in it; one that was named stays up
+            // for the pod's own stop.
             // https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
             try await client.stopContainer(options: opts)
             try await self.lock.withLock(logMetadata: ["acquirer": "\(#function)", "id": "\(id)"]) { context in

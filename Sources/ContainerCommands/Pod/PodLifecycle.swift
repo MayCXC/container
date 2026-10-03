@@ -21,11 +21,42 @@ import ContainerizationError
 import ContainerizationExtras
 import Foundation
 
+/// Act on several pods at once and report every failure, the way the container
+/// verbs act on several containers: each pod is attempted whatever became of
+/// the others, each that succeeded is printed, and the failures are thrown
+/// together.
+private func actOnPods(_ names: [String], _ act: @Sendable @escaping (String) async throws -> Void) async throws {
+    var errors: [any Error] = []
+    await withTaskGroup(of: (any Error)?.self) { group in
+        for name in names {
+            group.addTask {
+                do {
+                    try await act(name)
+                    print(name)
+                    return nil
+                } catch {
+                    return error
+                }
+            }
+        }
+
+        for await error in group {
+            if let error {
+                errors.append(error)
+            }
+        }
+    }
+
+    if !errors.isEmpty {
+        throw AggregateError(errors)
+    }
+}
+
 extension Application.PodCommand {
     public struct PodStart: AsyncLoggableCommand {
         public static let configuration = CommandConfiguration(
             commandName: "start",
-            abstract: "Boot a pod's machine, with the containers in it"
+            abstract: "Boot a pod's machine and start the containers in it"
         )
 
         @OptionGroup
@@ -43,10 +74,8 @@ extension Application.PodCommand {
             if let agent = ProcessInfo.processInfo.environment["SSH_AUTH_SOCK"] {
                 dynamicEnv["SSH_AUTH_SOCK"] = agent
             }
-            for name in names {
-                try await ClientPod.start(name, dynamicEnv: dynamicEnv)
-                print(name)
-            }
+            let env = dynamicEnv
+            try await actOnPods(names) { try await ClientPod.start($0, dynamicEnv: env) }
         }
     }
 
@@ -65,10 +94,7 @@ extension Application.PodCommand {
         public init() {}
 
         public func run() async throws {
-            for name in names {
-                try await ClientPod.stop(name)
-                print(name)
-            }
+            try await actOnPods(names) { try await ClientPod.stop($0) }
         }
     }
 
@@ -91,10 +117,8 @@ extension Application.PodCommand {
         public init() {}
 
         public func run() async throws {
-            for name in names {
-                try await ClientPod.delete(name, force: force)
-                print(name)
-            }
+            let force = self.force
+            try await actOnPods(names) { try await ClientPod.delete($0, force: force) }
         }
     }
 
