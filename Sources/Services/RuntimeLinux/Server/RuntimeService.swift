@@ -1621,11 +1621,15 @@ public actor RuntimeService {
         // A container the machine already holds keeps its place. One that is
         // running is left as it is; one that is stopped, whether it ran and
         // exited or was placed and never started, is given this request's
-        // streams for its next start.
+        // streams for its next start, and its forwarding is pointed at the
+        // agent the request names, the way an exec's is.
         let id = URL(filePath: path).lastPathComponent
         if let held = self.containers[id] {
             guard held.status != .running else {
                 return
+            }
+            if held.config.ssh {
+                self.donateAgentSocket(container: held, dynamicEnv: dynamicEnv)
             }
             try await self.rebind(held, stdio: stdio)
             return
