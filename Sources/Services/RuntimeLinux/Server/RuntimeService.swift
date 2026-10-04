@@ -162,10 +162,10 @@ public actor RuntimeService {
         }
 
         return try await self.lock.withLock { _ in
-            // A machine that is not waiting to be brought up is running, and a
-            // request for one that is running is a container joining it: what
-            // the machine does not hold yet goes in, and the machine stays as
-            // it is.
+            // A machine that is not waiting to be brought up is up, and a
+            // request for one that is up is a container joining it: what the
+            // machine does not hold yet goes in, and the machine stays as it
+            // is.
             guard await self.state == .created else {
                 // A machine on its way down takes no more containers: placing
                 // one in it leaves a start that reported success and a
@@ -216,7 +216,6 @@ public actor RuntimeService {
             let containerId = containerInfo.id
             if id == containerId {
                 try await self.startInitProcess(containerId, lock: lock)
-                await self.setState(.running)
             } else {
                 try await self.startExecProcess(processId: id, lock: lock)
             }
@@ -313,11 +312,17 @@ public actor RuntimeService {
 
         return try await self.lock.withLock { [self] _ in
             switch await self.state {
-            case .running, .booted:
+            case .ready:
                 let id = try message.id()
                 let config = try message.processConfig()
                 let stdio = message.stdio()
                 let container = try await self.addressedContainer(message)
+                guard container.status == .running else {
+                    throw ContainerizationError(
+                        .invalidState,
+                        message: "cannot exec: container \(container.id) is not running"
+                    )
+                }
 
                 try await self.addNewProcess(id, in: container.id, config, stdio)
 
@@ -347,7 +352,7 @@ public actor RuntimeService {
             default:
                 throw ContainerizationError(
                     .invalidState,
-                    message: "cannot exec: container is not running"
+                    message: "cannot exec: the machine is not ready"
                 )
             }
         }
@@ -366,29 +371,34 @@ public actor RuntimeService {
         self.log.debug("enter", metadata: ["func": "\(#function)"])
         defer { self.log.debug("exit", metadata: ["func": "\(#function)"]) }
 
-        var status: RuntimeStatus = .unknown
+        let status: SandboxStatus
         var networks: [Attachment] = []
         var snapshots: [ContainerSnapshot] = []
 
         switch state {
-        case .created, .stopped, .booted, .shuttingDown:
-            status = .stopped
-        case .stopping:
-            status = .stopping
-        case .running:
-            status = .running
-            // The attachments belong to the machine, so any container in it
-            // reports the same ones.
-            networks = self.containers.values.first?.attachments ?? []
+        case .created:
+            status = .created
+        case .ready:
+            status = .ready
+            // The addresses are the machine's, claimed when it booted, so it
+            // reports them whether or not a container is in it yet; each
+            // container reports its own state, made or running.
+            networks = self.podAttachments
             snapshots = self.containers.values
                 .sorted { $0.id < $1.id }
                 .map {
                     ContainerSnapshot(
                         configuration: $0.config,
-                        status: RuntimeStatus.running,
+                        status: $0.status,
                         networks: $0.attachments
                     )
                 }
+        case .stopping:
+            status = .stopping
+        case .stopped:
+            status = .stopped
+        case .shuttingDown:
+            status = .shuttingDown
         }
 
         let reply = message.reply()
@@ -422,7 +432,7 @@ public actor RuntimeService {
 
         return try await self.lock.withLock { _ in
             switch await self.state {
-            case .running, .booted:
+            case .ready:
                 await self.setState(.stopping)
 
                 let sandbox = try await self.getSandbox()
@@ -511,7 +521,7 @@ public actor RuntimeService {
 
         try await self.lock.withLock { [self] _ in
             switch await self.state {
-            case .running:
+            case .ready:
                 // A process named for a container in the machine is that
                 // container's init; anything else was started by an exec.
                 guard await self.isContainer(id) else {
@@ -530,7 +540,7 @@ public actor RuntimeService {
             default:
                 throw ContainerizationError(
                     .invalidState,
-                    message: "cannot kill: the machine is not running"
+                    message: "cannot kill: the machine is not ready"
                 )
             }
         }
@@ -561,7 +571,7 @@ public actor RuntimeService {
         defer { self.log.trace("exit", metadata: ["func": "\(#function)"]) }
 
         switch self.state {
-        case .running:
+        case .ready:
             let id = try message.id()
             let width = message.uint64(key: RuntimeKeys.width.rawValue)
             let height = message.uint64(key: RuntimeKeys.height.rawValue)
@@ -591,7 +601,7 @@ public actor RuntimeService {
         default:
             throw ContainerizationError(
                 .invalidState,
-                message: "cannot resize: container is not running"
+                message: "cannot resize: the machine is not ready"
             )
         }
     }
@@ -635,7 +645,7 @@ public actor RuntimeService {
     public func copyIn(_ message: XPCMessage) async throws -> XPCMessage {
         self.log.info("`copyIn` xpc handler")
         switch self.state {
-        case .running, .booted:
+        case .ready:
             guard let source = message.string(key: RuntimeKeys.sourcePath.rawValue) else {
                 throw ContainerizationError(
                     .invalidArgument,
@@ -651,7 +661,7 @@ public actor RuntimeService {
             let mode = UInt32(message.uint64(key: RuntimeKeys.fileMode.rawValue))
             let createParents = message.bool(key: RuntimeKeys.createParents.rawValue)
 
-            let ctr = try addressedContainer(message)
+            let ctr = try runningContainer(message)
             try await self.getSandbox().copyIn(
                 ctr.id,
                 from: URL(fileURLWithPath: source),
@@ -664,7 +674,7 @@ public actor RuntimeService {
         default:
             throw ContainerizationError(
                 .invalidState,
-                message: "cannot copyIn: container is not running"
+                message: "cannot copyIn: the machine is not ready"
             )
         }
     }
@@ -681,7 +691,7 @@ public actor RuntimeService {
     public func copyOut(_ message: XPCMessage) async throws -> XPCMessage {
         self.log.info("`copyOut` xpc handler")
         switch self.state {
-        case .running, .booted:
+        case .ready:
             guard let source = message.string(key: RuntimeKeys.sourcePath.rawValue) else {
                 throw ContainerizationError(
                     .invalidArgument,
@@ -697,7 +707,7 @@ public actor RuntimeService {
 
             let createParents = message.bool(key: RuntimeKeys.createParents.rawValue)
 
-            let ctr = try addressedContainer(message)
+            let ctr = try runningContainer(message)
             try await self.getSandbox().copyOut(
                 ctr.id,
                 from: URL(fileURLWithPath: source),
@@ -709,7 +719,7 @@ public actor RuntimeService {
         default:
             throw ContainerizationError(
                 .invalidState,
-                message: "cannot copyOut: container is not running"
+                message: "cannot copyOut: the machine is not ready"
             )
         }
     }
@@ -729,7 +739,7 @@ public actor RuntimeService {
     public func snapshotDisk(_ message: XPCMessage) async throws -> XPCMessage {
         self.log.info("`snapshotDisk` xpc handler")
         switch self.state {
-        case .running, .booted:
+        case .ready:
             guard let imagePath = message.string(key: RuntimeKeys.imagePath.rawValue) else {
                 throw ContainerizationError(
                     .invalidArgument,
@@ -745,7 +755,7 @@ public actor RuntimeService {
 
             let ctr = try addressedContainer(message)
             let sandbox = try getSandbox()
-            let shouldFreeze = self.state == .running
+            let shouldFreeze = ctr.status == .running
 
             if shouldFreeze {
                 try await sandbox.filesystemOperation(ctr.id, operation: .freeze, path: "/")
@@ -776,7 +786,7 @@ public actor RuntimeService {
         default:
             throw ContainerizationError(
                 .invalidState,
-                message: "cannot snapshot disk: container is not running"
+                message: "cannot snapshot disk: the machine is not ready"
             )
         }
     }
@@ -792,7 +802,7 @@ public actor RuntimeService {
     public func clean(_ message: XPCMessage) async throws -> XPCMessage {
         self.log.info("`clean` xpc handler")
         switch self.state {
-        case .running:
+        case .ready:
             guard let id = message.string(key: RuntimeKeys.id.rawValue) else {
                 throw ContainerizationError(
                     .invalidArgument,
@@ -801,6 +811,12 @@ public actor RuntimeService {
             }
 
             let ctr = try getContainer(id)
+            guard ctr.status == .running else {
+                throw ContainerizationError(
+                    .invalidState,
+                    message: "cannot clean: container \(id) is not running"
+                )
+            }
             let sandbox = try getSandbox()
 
             var targets: [String] = []
@@ -832,7 +848,7 @@ public actor RuntimeService {
         default:
             throw ContainerizationError(
                 .invalidState,
-                message: "cannot clean: container is not running"
+                message: "cannot clean: the machine is not ready"
             )
         }
     }
@@ -851,7 +867,7 @@ public actor RuntimeService {
         defer { self.log.debug("exit", metadata: ["func": "\(#function)"]) }
 
         switch self.state {
-        case .running, .booted:
+        case .ready:
             let port = message.uint64(key: RuntimeKeys.port.rawValue)
             guard port > 0 else {
                 throw ContainerizationError(
@@ -868,7 +884,7 @@ public actor RuntimeService {
         default:
             throw ContainerizationError(
                 .invalidState,
-                message: "cannot dial: container is not running"
+                message: "cannot dial: the machine is not ready"
             )
         }
     }
@@ -877,10 +893,10 @@ public actor RuntimeService {
         let info = try self.getContainer(id)
         let sandbox = try self.getSandbox()
 
-        guard self.state == .booted || self.state == .running else {
+        guard self.state == .ready else {
             throw ContainerizationError(
                 .invalidState,
-                message: "the machine is \(self.state), and a container starts only in a machine that is booted or running"
+                message: "the machine is \(self.state), and a container starts only in a machine that is ready"
             )
         }
 
@@ -899,6 +915,7 @@ public actor RuntimeService {
                 return code
             }
             try await self.monitor.track(id: id, waitingOn: waitFunc)
+            self.containers[id]?.status = .running
         } catch {
             // The failure is this container's: its place is given back and the
             // machine stays up for its siblings, the way a sandbox stands after
@@ -1448,7 +1465,7 @@ public actor RuntimeService {
         if let primary = attachments.first {
             try await self.startSocketForwarders(attachment: primary, publishedPorts: config.publishedPorts)
         }
-        self.setState(.booted)
+        self.setState(.ready)
 
         return message.reply()
     }
@@ -1547,7 +1564,8 @@ public actor RuntimeService {
                     config: config,
                     attachments: attachments,
                     bundle: bundle,
-                    io: (in: stdin, out: stdout, err: stderr)
+                    io: (in: stdin, out: stdout, err: stderr),
+                    status: .stopped
                 )
             )
 
@@ -1698,6 +1716,20 @@ public actor RuntimeService {
             )
         }
         return try getContainer(id)
+    }
+
+    /// The container a message is addressed to, which has to be running: what
+    /// is asked of it reaches into a filesystem only a started container has
+    /// mounted.
+    private func runningContainer(_ message: XPCMessage) throws -> ContainerInfo {
+        let container = try addressedContainer(message)
+        guard container.status == .running else {
+            throw ContainerizationError(
+                .invalidState,
+                message: "container \(container.id) is not running"
+            )
+        }
+        return container
     }
 
     /// Stop one container in the sandbox and wait for it, then leave.
@@ -2060,29 +2092,40 @@ extension RuntimeService {
         let io: [FileHandle?]
     }
 
+    /// A container the machine holds: what it was placed with, and whether its
+    /// init process runs. It is `stopped` from its placement until its start
+    /// and `running` from then until its exit takes it out of the machine,
+    /// the two names the control plane gives a container that is made and one
+    /// that runs.
     private struct ContainerInfo {
         let config: ContainerConfiguration
         let attachments: [Attachment]
         let bundle: ContainerResource.Bundle
         let io: (in: FileHandle?, out: MultiWriter?, err: MultiWriter?)
+        var status: RuntimeStatus
 
         var id: String { config.id }
     }
 
-    /// States the underlying sandbox can be in.
+    /// Where the machine is in its life.
+    ///
+    /// The containers in it have states of their own (`ContainerInfo.status`);
+    /// the machine's say whether it takes them, which is the sandbox's state
+    /// in the runtime interface: ready from the moment it is up, holding its
+    /// containers or none yet.
+    /// https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
     public enum State: Sendable, Equatable {
-        /// Sandbox is created. This should be what the service starts the sandbox in.
+        /// The service is up and waiting to boot the machine.
         case created
-        /// Bootstrap will transition a .created state to .booted.
-        case booted
-        /// startProcess on the init process will transition .booted to .running.
-        case running
-        /// At the beginning of stop() .running will be transitioned to .stopping.
+        /// Bootstrap booted the machine; it takes containers and runs them.
+        case ready
+        /// The machine is on its way down, from the start of a stop or from
+        /// the last container leaving a machine nobody named.
         case stopping
-        /// Once a stop is successful, .stopping will transition to .stopped.
+        /// The machine has stopped and its containers are cleaned up.
         case stopped
-        /// .shuttingDown will be the last state the runtime service will ever be in. Shortly
-        /// afterwards the process will exit.
+        /// The last state the service is ever in; the process exits shortly
+        /// afterwards.
         case shuttingDown
     }
 

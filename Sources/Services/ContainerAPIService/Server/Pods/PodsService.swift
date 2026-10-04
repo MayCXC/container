@@ -181,9 +181,9 @@ public actor PodsService {
                 do {
                     let client = try await RuntimeClient.create(id: id, runtime: runtime)
                     let sandbox = try await client.state()
-                    guard sandbox.status == .running else {
+                    guard sandbox.status == .ready else {
                         self.log.info(
-                            "a pod's machine answered but is not running",
+                            "a pod's machine answered but is not ready",
                             metadata: ["pod": "\(id)", "status": "\(sandbox.status)"])
                         continue
                     }
@@ -439,14 +439,17 @@ public actor PodsService {
                 // A machine can be gone while the service that ran it lingers:
                 // stopped out of band, crashed, or torn down without the pod
                 // hearing of it. A pod that offered that machine would be
-                // offering one that is not there, so the client is believed only
-                // while its machine answers running: an answer of anything else
-                // means the machine is gone, and the service is taken down so
-                // the pod boots a fresh machine the way it booted the first. No
-                // answer at all is the query failing, not the machine standing
-                // down; a fresh machine booted against devices a live one still
-                // holds fails at its attachments, so the start fails on the
-                // query instead and the held client stands.
+                // offering one that is not there, so the client is believed
+                // only while its machine answers for a sandbox that is there to
+                // be used: ready, holding its containers or none yet, or
+                // created, waiting for the boot the bootstrap below gives it.
+                // A machine that answers stopped or shutting down is gone, and
+                // its service is taken down so the pod boots a fresh machine
+                // the way it booted the first. No answer at all is the query
+                // failing, not the machine standing down; a fresh machine
+                // booted against devices a live one still holds fails at its
+                // attachments, so the start fails on the query instead and the
+                // held client stands.
                 //
                 // A machine that answers stopping is on its way out and is left
                 // to finish: its service taken down meanwhile kills it in the
@@ -454,7 +457,7 @@ public actor PodsService {
                 // answers something else.
                 if let held = running {
                     let observed = try await self.settledState(of: held, pod: id)
-                    if observed.status != .running {
+                    if observed.status == .stopped || observed.status == .shuttingDown {
                         try await self.deregister(id: id)
                         state.client = nil
                         state.state = .notReady
@@ -727,19 +730,19 @@ public actor PodsService {
     private func snapshot(_ state: PodState) async -> PodSnapshot {
         let members = await self.containers(of: state.configuration.id)
         var networks: [Attachment] = []
-        // A pod is ready when its machine is running, which is what the machine
-        // says rather than what it was last told to do: the machine goes down on
-        // its own once the last container in it has stopped, and a pod that
-        // answered ready after that would be offering a machine that is not
-        // there.
-        var running = false
+        // A pod is ready when its machine is, which is what the machine says
+        // rather than what it was last told to do: a machine nobody named goes
+        // down on its own once the last container in it has stopped, and a pod
+        // that answered ready after that would be offering a machine that is
+        // not there.
+        var ready = false
         if let client = state.client, let sandbox = try? await client.state() {
             networks = sandbox.networks
-            running = sandbox.status == .running
+            ready = sandbox.status == .ready
         }
         return PodSnapshot(
             configuration: state.configuration,
-            state: state.state == .ready && running ? .ready : .notReady,
+            state: state.state == .ready && ready ? .ready : .notReady,
             networks: networks,
             containers: members.map { $0.id }.sorted(),
             startedDate: state.startedDate
