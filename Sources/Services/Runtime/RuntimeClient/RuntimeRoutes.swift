@@ -37,6 +37,11 @@ public enum RuntimeRoutes: String {
     /// stops a sandbox with separate calls for this reason.
     /// https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
     case stopContainer = "com.apple.container.runtime/stopContainer"
+    /// Take a stopped container out of the sandbox, giving up the devices it
+    /// held, so its name is free to place again. The runtime interface
+    /// removes a container with a call of its own, apart from stopping it.
+    /// https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
+    case removeContainer = "com.apple.container.runtime/removeContainer"
     /// Return the current state of the sandbox.
     case state = "com.apple.container.runtime/state"
     /// Get resource usage statistics for the sandbox.

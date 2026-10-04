@@ -239,6 +239,22 @@ extension RuntimeClient {
         }
     }
 
+    /// Take the stopped container this client addresses out of the machine,
+    /// giving up the devices it held, so its name is free to place again.
+    public func removeContainer() async throws {
+        let request = self.request(RuntimeRoutes.removeContainer.rawValue)
+
+        do {
+            try await self.client.send(request)
+        } catch {
+            throw ContainerizationError(
+                .internalError,
+                message: "failed to remove container \(self.containerId ?? self.id)",
+                cause: error
+            )
+        }
+    }
+
     public func stop(options: ContainerStopOptions) async throws {
         let request = self.request(RuntimeRoutes.stop.rawValue)
 

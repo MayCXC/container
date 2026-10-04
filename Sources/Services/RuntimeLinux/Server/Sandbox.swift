@@ -31,14 +31,19 @@ protocol Sandbox: Sendable {
     /// Boot the machine and set up the containers registered in it.
     func create() async throws
 
-    /// Start a container's init process.
-    func startContainer(_ id: String) async throws
+    /// Start a container's init process, with its process configuration as
+    /// `configuration` leaves it: the streams of this start among it.
+    func startContainer(
+        _ id: String,
+        configuration: (@Sendable (inout LinuxProcessConfiguration) throws -> Void)?
+    ) async throws
 
-    /// Stop a container, leaving the machine running for the others.
+    /// Stop a container, leaving the machine running for the others and the
+    /// container's place kept for its next start.
     func stopContainer(_ id: String) async throws
 
-    /// Take a stopped container out of the machine, so its name is free to
-    /// place again.
+    /// Take a stopped container out of the machine, giving up its devices, so
+    /// its name is free to place again.
     func removeContainer(_ id: String) async throws
 
     /// Signal a container's init process.

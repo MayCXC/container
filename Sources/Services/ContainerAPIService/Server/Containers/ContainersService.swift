@@ -1129,6 +1129,15 @@ public actor ContainersService {
         // configuration only there.
         let pod = try? Self.getContainerConfiguration(at: path).0.pod
 
+        // A machine that is up keeps a stopped container's place, its root
+        // filesystem attached, until the container is removed from it; the
+        // bundle holding that filesystem goes only once the machine has let
+        // it go. A pod whose machine is down holds no place to give up.
+        // https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
+        if let pod, let client = try? await self.podClient(for: pod, member: id) {
+            try await client.removeContainer()
+        }
+
         // Always try to delete the bundle directory, even if it's incomplete
         do {
             try bundle.delete()

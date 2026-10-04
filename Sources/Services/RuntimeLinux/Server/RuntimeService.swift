@@ -443,7 +443,7 @@ public actor RuntimeService {
                 // https://github.com/kubernetes/kubernetes/blob/master/pkg/kubelet/kuberuntime/kuberuntime_container.go
                 var exitStatuses: [String: ExitStatus] = [:]
                 try await withThrowingTaskGroup(of: (String, ExitStatus).self) { group in
-                    for ctr in await self.sortedContainers() {
+                    for ctr in await self.sortedContainers() where ctr.status == .running {
                         let id = ctr.id
                         let signal = try Signal(requested ?? ctr.config.stopSignal ?? "SIGTERM")
                         group.addTask {
@@ -456,16 +456,13 @@ public actor RuntimeService {
                 }
                 try await sandbox.stop()
 
-                do {
-                    if case .stopped = await self.state {
-                        return message.reply()
-                    }
-                    for ctr in await self.sortedContainers() {
-                        try await self.cleanUpContainer(containerInfo: ctr, exitStatus: exitStatuses[ctr.id])
-                    }
-                } catch {
-                    self.log.error("failed to clean up container", metadata: ["error": "\(error)"])
+                if case .stopped = await self.state {
+                    return message.reply()
                 }
+                for ctr in await self.sortedContainers() where ctr.status == .running {
+                    await self.containerExited(ctr, exitStatus: exitStatuses[ctr.id])
+                }
+                await self.releaseMachineResources()
                 await self.setState(.stopped)
             default:
                 break
@@ -492,6 +489,11 @@ public actor RuntimeService {
         let timeout: Duration = .seconds(stopOptions.timeoutInSeconds)
 
         return try await self.lock.withLock { _ in
+            // A container that is not running has nothing to stop; stopping
+            // it again answers the same as the first time.
+            guard try await self.getContainer(container.id).status == .running else {
+                return message.reply()
+            }
             let sandbox = try await self.getSandbox()
             _ = try await self.gracefulStopContainer(
                 sandbox,
@@ -499,6 +501,41 @@ public actor RuntimeService {
                 signal: signal,
                 timeout: timeout
             )
+            return message.reply()
+        }
+    }
+
+    /// Take a stopped container out of the machine: its block devices are
+    /// detached and its name is free to place again. A running container keeps
+    /// its place and is refused; a container the machine does not hold, or a
+    /// machine that is going or gone, has nothing to give up. The runtime
+    /// interface removes a container with a call of its own, apart from
+    /// stopping it.
+    /// https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
+    @Sendable
+    public func removeContainer(_ message: XPCMessage) async throws -> XPCMessage {
+        self.log.debug("enter", metadata: ["func": "\(#function)"])
+        defer { self.log.debug("exit", metadata: ["func": "\(#function)"]) }
+
+        guard let id = message.string(key: RuntimeKeys.containerId.rawValue), !id.isEmpty else {
+            throw ContainerizationError(
+                .invalidArgument,
+                message: "the request names no container to remove"
+            )
+        }
+
+        return try await self.lock.withLock { _ in
+            guard await self.state == .ready, let held = await self.containers[id] else {
+                return message.reply()
+            }
+            guard held.status != .running else {
+                throw ContainerizationError(
+                    .invalidState,
+                    message: "container \(id) is running and keeps its place"
+                )
+            }
+            try await self.getSandbox().removeContainer(id)
+            await self.forgetContainer(held)
             return message.reply()
         }
     }
@@ -901,9 +938,17 @@ public actor RuntimeService {
         }
 
         do {
+            // The streams are the start's: the request that placed the
+            // container, or the latest to name it since, left them in the
+            // registry, and the process started here is the one that writes
+            // to them.
             let io = info.io
 
-            try await sandbox.startContainer(id)
+            try await sandbox.startContainer(id) { process in
+                process.stdin = io.in
+                process.stdout = io.out
+                process.stderr = io.err
+            }
             let waitFunc: ExitMonitor.WaitHandler = {
                 let code = try await sandbox.waitContainer(id, timeoutInSeconds: nil)
                 if let out = io.out {
@@ -917,12 +962,14 @@ public actor RuntimeService {
             try await self.monitor.track(id: id, waitingOn: waitFunc)
             self.containers[id]?.status = .running
         } catch {
-            // The failure is this container's: its place is given back and the
-            // machine stays up for its siblings, the way a sandbox stands after
-            // one of its containers fails to start. A machine nobody named
-            // stops with the last thing in it, here as when a container exits.
+            // The failure is this container's: it keeps its place, stopped,
+            // and the machine stays up for its siblings, the way a sandbox
+            // stands after one of its containers fails to start. A machine
+            // nobody named stops with the last thing in it, here as when a
+            // container exits.
             // https://github.com/kubernetes/kubernetes/blob/master/pkg/kubelet/kuberuntime/kuberuntime_manager.go
-            try? await self.cleanUpContainer(containerInfo: info)
+            try? await sandbox.stopContainer(id)
+            await self.containerExited(info, exitStatus: nil)
             try? await self.stopMachineIfEmpty()
             throw error
         }
@@ -942,7 +989,7 @@ public actor RuntimeService {
         if sandbox is LinuxPod, !self.sandboxStopsWithContainers {
             return
         }
-        guard self.containers.isEmpty else {
+        guard !self.containers.values.contains(where: { $0.status == .running }) else {
             return
         }
         // The machine is on its way down from here and says so to whoever
@@ -951,7 +998,17 @@ public actor RuntimeService {
         // running machine that is gone by the time its request lands.
         self.setState(.stopping)
         try? await sandbox.stop()
+        await self.releaseMachineResources()
         self.setState(.stopped)
+    }
+
+    /// Give up what the machine held for its containers once it has stopped:
+    /// the ports forwarded to it and the addresses it claimed are the
+    /// machine's, shared by every container in it, so they go with it.
+    private func releaseMachineResources() async {
+        await self.stopSocketForwarders()
+        for session in networkSessions { session.close() }
+        networkSessions = []
     }
 
     private func startExecProcess(processId id: String, lock: AsyncLock.Context) async throws {
@@ -1082,11 +1139,15 @@ public actor RuntimeService {
                 break
             }
 
+            // The container keeps its place in the machine, so it starts
+            // again where it was; what goes with its process is the process
+            // record and the rootfs mount.
             do {
-                try await cleanUpContainer(containerInfo: ctrInfo, exitStatus: exitStatus)
+                try await self.getSandbox().stopContainer(id)
             } catch {
-                self.log.error("failed to clean up container", metadata: ["error": "\(error)"])
+                self.log.error("failed to stop container after its exit", metadata: ["id": "\(id)", "error": "\(error)"])
             }
+            await self.containerExited(ctrInfo, exitStatus: exitStatus)
 
             try await self.stopMachineIfEmpty()
         }
@@ -1474,13 +1535,13 @@ public actor RuntimeService {
     ///
     /// Each brings its own bundle, holding its configuration and its root
     /// filesystem, and takes the machine's processors, memory, swap and
-    /// addresses as they are. One already in the machine stays as it is, so a
+    /// addresses as they are. One already in the machine keeps its place, so a
     /// request naming every container the pod holds puts in what is missing and
-    /// leaves the rest alone.
+    /// leaves the rest where they are.
     ///
     /// The standard streams belong to the one container whose start the request
-    /// is; the others are placed with none and are given theirs when they are
-    /// started in turn.
+    /// is, and are bound when it starts; the others are given none, and take
+    /// theirs from the start that names each in turn.
     private func placeContainers(_ message: XPCMessage) async throws {
         self.log.debug("enter", metadata: ["func": "\(#function)"])
         defer { self.log.debug("exit", metadata: ["func": "\(#function)"]) }
@@ -1509,9 +1570,16 @@ public actor RuntimeService {
             )
         }
 
-        // A container the machine already holds is one this request has nothing
-        // to do for.
-        guard !self.isContainer(URL(filePath: path).lastPathComponent) else {
+        // A container the machine already holds keeps its place. One that is
+        // running is left as it is; one that is stopped, whether it ran and
+        // exited or was placed and never started, is given this request's
+        // streams for its next start.
+        let id = URL(filePath: path).lastPathComponent
+        if let held = self.containers[id] {
+            guard held.status != .running else {
+                return
+            }
+            try await self.rebind(held, stdio: stdio)
             return
         }
 
@@ -1524,25 +1592,8 @@ public actor RuntimeService {
             }
 
             let bundle = ContainerResource.Bundle(path: root)
-            try bundle.createLogFile()
             let config = try bundle.configuration
-            let containerLog = try FileHandle(forWritingTo: bundle.containerLog)
-            let stdout = {
-                if let h = stdio[1] {
-                    return MultiWriter(handles: [h, containerLog])
-                }
-                return MultiWriter(handles: [containerLog])
-            }()
-            let stderr: MultiWriter? = {
-                if !config.initProcess.terminal {
-                    if let h = stdio[2] {
-                        return MultiWriter(handles: [h, containerLog])
-                    }
-                    return MultiWriter(handles: [containerLog])
-                }
-                return nil
-            }()
-            let stdin = stdio[0] ?? nil
+            let io = try Self.streams(of: bundle, config: config, stdio: stdio)
 
             let rootfs = try bundle.containerRootfs.asMount
             let attachments = self.podAttachments
@@ -1554,9 +1605,6 @@ public actor RuntimeService {
                     dynamicEnv: dynamicEnv,
                     log: self.log
                 )
-                czConfig.process.stdout = stdout
-                czConfig.process.stderr = stderr
-                czConfig.process.stdin = stdin
             }
 
             self.setContainer(
@@ -1564,7 +1612,7 @@ public actor RuntimeService {
                     config: config,
                     attachments: attachments,
                     bundle: bundle,
-                    io: (in: stdin, out: stdout, err: stderr),
+                    io: io,
                     status: .stopped
                 )
             )
@@ -1575,6 +1623,53 @@ public actor RuntimeService {
             try self.initializeWaiters(for: config.id)
             try await self.monitor.registerProcess(id: config.id, onExit: self.onContainerExit)
         }
+    }
+
+    /// Give a container the machine holds the streams of the request that
+    /// starts it next. The streams of its last run were closed with its exit;
+    /// a container placed and never started holds open ones, closed here
+    /// before they are replaced. A waiter stands from the placement until the
+    /// exit answers it, so one is registered only where the exit took it.
+    private func rebind(_ held: ContainerInfo, stdio: [FileHandle?]) async throws {
+        var info = held
+        Self.closeStreams(info.io)
+        info.io = try Self.streams(of: info.bundle, config: info.config, stdio: stdio)
+        self.setContainer(info)
+
+        if self.waiters[info.id] == nil {
+            try self.initializeWaiters(for: info.id)
+        }
+        await self.monitor.stopTracking(id: info.id)
+        try await self.monitor.registerProcess(id: info.id, onExit: self.onContainerExit)
+    }
+
+    /// The streams a start binds: what the request brought, each written
+    /// through to the container's log, and the log alone where it brought
+    /// none. A terminal carries its own error stream.
+    private static func streams(
+        of bundle: ContainerResource.Bundle,
+        config: ContainerConfiguration,
+        stdio: [FileHandle?]
+    ) throws -> (in: FileHandle?, out: MultiWriter?, err: MultiWriter?) {
+        try bundle.createLogFile()
+        let containerLog = try FileHandle(forWritingTo: bundle.containerLog)
+        let stdout = {
+            if let h = stdio[1] {
+                return MultiWriter(handles: [h, containerLog])
+            }
+            return MultiWriter(handles: [containerLog])
+        }()
+        let stderr: MultiWriter? = {
+            if !config.initProcess.terminal {
+                if let h = stdio[2] {
+                    return MultiWriter(handles: [h, containerLog])
+                }
+                return MultiWriter(handles: [containerLog])
+            }
+            return nil
+        }()
+        let stdin = stdio[0] ?? nil
+        return (in: stdin, out: stdout, err: stderr)
     }
 
     /// Hold the running machine to a memory size, which its containers share.
@@ -1774,45 +1869,41 @@ public actor RuntimeService {
         return code
     }
 
-    private func cleanUpContainer(containerInfo: ContainerInfo, exitStatus: ExitStatus? = nil) async throws {
+    /// What the registry records once a container's init process has gone,
+    /// by its own exit, a failed start or the machine's stop: the container
+    /// keeps its place and is stopped, its process and the wait on it are let
+    /// go, and whoever waited is answered with how it ended. The waiter's
+    /// name goes with the answer, so the container's next start registers a
+    /// waiter of its own.
+    private func containerExited(_ containerInfo: ContainerInfo, exitStatus: ExitStatus?) async {
         let id = containerInfo.id
-
-        do {
-            try await self.getSandbox().stopContainer(id)
-        } catch {
-            self.log.error("failed to stop container during cleanup", metadata: ["error": "\(error)"])
-        }
-
-        // The machine keeps a stopped container's place until it is given
-        // back. The registry below forgets the name, so the machine must give
-        // it up too, or the next placement under it is refused against a
-        // place nothing holds.
-        do {
-            try await self.getSandbox().removeContainer(id)
-        } catch {
-            self.log.error("failed to remove container during cleanup", metadata: ["error": "\(error)"])
-        }
-
-        self.containers.removeValue(forKey: id)
+        self.containers[id]?.status = .stopped
         self.processes.removeValue(forKey: id)
         await self.monitor.stopTracking(id: id)
 
-        // The forwarders and the network sessions are the machine's, which the
-        // sandbox's containers share, so they are given up once the last of
-        // them is gone.
-        if self.containers.isEmpty {
-            await self.stopSocketForwarders()
-
-            for session in networkSessions { session.close() }
-            networkSessions = []
-        }
-
         let status = exitStatus ?? ExitStatus(exitCode: 255)
         self.releaseWaiters(for: id, status: status)
-        // The waiter's name is given back with the container's: whoever was
-        // waiting has been answered, and the next container under this name
-        // registers a waiter of its own.
         self.waiters.removeValue(forKey: id)
+    }
+
+    /// Forget a container the machine has let go of: its name is free, and the
+    /// streams it held open are closed.
+    private func forgetContainer(_ containerInfo: ContainerInfo) async {
+        let id = containerInfo.id
+        self.containers.removeValue(forKey: id)
+        self.processes.removeValue(forKey: id)
+        await self.monitor.stopTracking(id: id)
+        self.waiters.removeValue(forKey: id)
+        Self.closeStreams(containerInfo.io)
+    }
+
+    /// Close a container's streams. The ones a process wrote to were closed
+    /// with its exit, and closing them again is refused, so each is tried on
+    /// its own.
+    private static func closeStreams(_ io: (in: FileHandle?, out: MultiWriter?, err: MultiWriter?)) {
+        try? io.in?.close()
+        try? io.out?.close()
+        try? io.err?.close()
     }
 }
 
@@ -2093,15 +2184,17 @@ extension RuntimeService {
     }
 
     /// A container the machine holds: what it was placed with, and whether its
-    /// init process runs. It is `stopped` from its placement until its start
-    /// and `running` from then until its exit takes it out of the machine,
-    /// the two names the control plane gives a container that is made and one
-    /// that runs.
+    /// init process runs. It is `stopped` from its placement until its start,
+    /// `running` from then until its exit, and `stopped` again from the exit,
+    /// in its place, until its next start or its removal: the two names the
+    /// control plane gives a container that is made and one that runs.
     private struct ContainerInfo {
         let config: ContainerConfiguration
         let attachments: [Attachment]
         let bundle: ContainerResource.Bundle
-        let io: (in: FileHandle?, out: MultiWriter?, err: MultiWriter?)
+        /// The streams the container's next start binds, left by the request
+        /// that placed it or the latest to name it since.
+        var io: (in: FileHandle?, out: MultiWriter?, err: MultiWriter?)
         var status: RuntimeStatus
 
         var id: String { config.id }
