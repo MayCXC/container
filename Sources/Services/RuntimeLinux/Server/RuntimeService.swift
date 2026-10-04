@@ -1553,11 +1553,20 @@ public actor RuntimeService {
         let stdioFor = message.string(key: RuntimeKeys.containerId.rawValue)
 
         for path in paths {
-            try await self.placeContainer(
-                at: path,
-                stdio: URL(filePath: path).lastPathComponent == stdioFor ? message.stdio() : [nil, nil, nil],
-                dynamicEnv: try message.dynamicEnv()
-            )
+            let id = URL(filePath: path).lastPathComponent
+            do {
+                try await self.placeContainer(
+                    at: path,
+                    stdio: id == stdioFor ? message.stdio() : [nil, nil, nil],
+                    dynamicEnv: try message.dynamicEnv()
+                )
+            } catch let error where id != stdioFor {
+                // A container's failure is its own: one a pod's start cannot
+                // place is left out, the rest are placed, and its own start,
+                // which follows, answers with the reason.
+                // https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
+                self.log.error("could not place a container", metadata: ["id": "\(id)", "error": "\(error)"])
+            }
         }
     }
 
@@ -1593,9 +1602,19 @@ public actor RuntimeService {
 
             let bundle = ContainerResource.Bundle(path: root)
             let config = try bundle.configuration
-            let io = try Self.streams(of: bundle, config: config, stdio: stdio)
 
+            // A root filesystem the machine cannot open is refused here, as
+            // this container's own failure, since a machine booting with it
+            // in its storage would fail to boot at all.
             let rootfs = try bundle.containerRootfs.asMount
+            guard FileManager.default.isReadableFile(atPath: rootfs.source) else {
+                throw ContainerizationError(
+                    .notFound,
+                    message: "the root filesystem of container \(config.id) at \(rootfs.source) is missing or unreadable"
+                )
+            }
+
+            let io = try Self.streams(of: bundle, config: config, stdio: stdio)
             let attachments = self.podAttachments
 
             try await pod.addContainer(config.id, rootfs: rootfs) { czConfig in
