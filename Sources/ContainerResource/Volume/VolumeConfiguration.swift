@@ -110,7 +110,8 @@ extension VolumeConfiguration {
 public enum VolumeError: Error, LocalizedError {
     case volumeNotFound(String)
     case volumeAlreadyExists(String)
-    case volumeInUse(String)
+    /// The volume and the containers using it, when they are known.
+    case volumeInUse(String, containers: [String] = [])
     case invalidVolumeName(String)
     case driverNotSupported(String)
     case storageError(String)
@@ -121,8 +122,11 @@ public enum VolumeError: Error, LocalizedError {
             return "volume '\(name)' not found"
         case .volumeAlreadyExists(let name):
             return "volume '\(name)' already exists"
-        case .volumeInUse(let name):
-            return "volume '\(name)' is currently in use and cannot be accessed by another container, or deleted"
+        case .volumeInUse(let name, let containers):
+            guard !containers.isEmpty else {
+                return "volume '\(name)' is currently in use and cannot be accessed by another container, or deleted"
+            }
+            return "volume '\(name)' is currently in use by container(s) \(containers.joined(separator: ", ")) and cannot be accessed by another container, or deleted"
         case .invalidVolumeName(let name):
             return "invalid volume name '\(name)'"
         case .driverNotSupported(let driver):

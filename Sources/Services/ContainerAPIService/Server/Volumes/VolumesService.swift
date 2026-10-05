@@ -369,7 +369,7 @@ public actor VolumesService {
         // the create then fails naming the missing volume.
         let referencing = try await containers.containersReferencingVolume(name)
         guard referencing.isEmpty else {
-            throw VolumeError.volumeInUse(name)
+            throw VolumeError.volumeInUse(name, containers: referencing.sorted())
         }
 
         try await self.store.delete(name)
