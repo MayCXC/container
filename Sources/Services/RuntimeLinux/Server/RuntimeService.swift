@@ -454,7 +454,15 @@ public actor RuntimeService {
                         exitStatuses[id] = status
                     }
                 }
-                try await sandbox.stop()
+                // The machine is down or failed once its stop returns, and
+                // what it held is let go either way, as the runtime cleans a
+                // container's own machine up past a failed stop.
+                // https://github.com/apple/container/blob/main/Sources/Services/RuntimeLinux/Server/RuntimeService.swift
+                do {
+                    try await sandbox.stop()
+                } catch {
+                    self.log.error("failed to stop the machine", metadata: ["error": "\(error)"])
+                }
 
                 if case .stopped = await self.state {
                     return message.reply()
@@ -985,38 +993,57 @@ public actor RuntimeService {
             // nobody named stops with the last thing in it, here as when a
             // container exits.
             // https://github.com/kubernetes/kubernetes/blob/master/pkg/kubelet/kuberuntime/kuberuntime_manager.go
-            try? await sandbox.stopContainer(id)
-            await self.containerExited(info, exitStatus: nil)
-            try? await self.stopMachineIfEmpty()
+            do {
+                try await sandbox.stopContainer(id)
+            } catch {
+                self.log.error("failed to stop a container whose start failed", metadata: ["id": "\(id)", "error": "\(error)"])
+            }
+            do {
+                try await self.recordExit(info, exitStatus: nil)
+            } catch {
+                self.log.error("failed to record the end of a container whose start failed", metadata: ["id": "\(id)", "error": "\(error)"])
+            }
             throw error
         }
     }
 
-    /// Stop a machine that exists for its containers once none is left in it.
+    /// Record that a container's init process has gone, stopping first a
+    /// machine that exists for its containers and has no other one running.
     ///
     /// A pod's machine is its sandbox, which outlives the containers that come
     /// and go in it: it holds the addresses and namespaces they share and is
     /// taken down when the pod is, not when a container in it leaves. A machine
     /// nobody named exists for its one container, so it stops with the last
     /// thing in it and releases the devices it held; the boot request says
-    /// which kind this machine is. Called with the lock held.
+    /// which kind this machine is. Such a machine stops before the exit is
+    /// recorded and its waiters answered, as the runtime stops a container's
+    /// own machine before it releases the container's waiters: whoever waited
+    /// acts on the end at once, and the machine's stop is what unmounts the
+    /// container's volumes and syncs what it wrote. Called with the lock held.
     /// https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
-    private func stopMachineIfEmpty() async throws {
+    /// https://github.com/apple/container/blob/main/Sources/Services/RuntimeLinux/Server/RuntimeService.swift
+    private func recordExit(_ info: ContainerInfo, exitStatus: ExitStatus?) async throws {
         let sandbox = try self.getSandbox()
-        if sandbox is LinuxPod, !self.sandboxStopsWithContainers {
-            return
+        let stopsMachine =
+            !(sandbox is LinuxPod && !self.sandboxStopsWithContainers)
+            && !self.containers.values.contains { $0.id != info.id && $0.status == .running }
+        if stopsMachine {
+            // The machine is on its way down from here and says so to whoever
+            // asks meanwhile, as the stop route does, so that a start arriving
+            // during the teardown waits for its end rather than reading a
+            // running machine that is gone by the time its request lands.
+            self.setState(.stopping)
+            do {
+                try await sandbox.stop()
+            } catch {
+                self.log.error("failed to stop the machine its last container left", metadata: ["id": "\(info.id)", "error": "\(error)"])
+            }
+            await self.releaseMachineResources()
         }
-        guard !self.containers.values.contains(where: { $0.status == .running }) else {
-            return
+        await self.containerExited(info, exitStatus: exitStatus)
+        if stopsMachine {
+            self.setState(.stopped)
         }
-        // The machine is on its way down from here and says so to whoever
-        // asks meanwhile, as the stop route does, so that a start arriving
-        // during the teardown waits for its end rather than reading a
-        // running machine that is gone by the time its request lands.
-        self.setState(.stopping)
-        try? await sandbox.stop()
-        await self.releaseMachineResources()
-        self.setState(.stopped)
     }
 
     /// Give up what the machine held for its containers once it has stopped:
@@ -1164,9 +1191,7 @@ public actor RuntimeService {
             } catch {
                 self.log.error("failed to stop container after its exit", metadata: ["id": "\(id)", "error": "\(error)"])
             }
-            await self.containerExited(ctrInfo, exitStatus: exitStatus)
-
-            try await self.stopMachineIfEmpty()
+            try await self.recordExit(ctrInfo, exitStatus: exitStatus)
         }
     }
 
