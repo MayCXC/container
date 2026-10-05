@@ -442,7 +442,7 @@ public actor RuntimeService {
                 // request named one, as a container stopped by itself is.
                 // https://github.com/kubernetes/kubernetes/blob/master/pkg/kubelet/kuberuntime/kuberuntime_container.go
                 var exitStatuses: [String: ExitStatus] = [:]
-                try await withThrowingTaskGroup(of: (String, ExitStatus).self) { group in
+                try await withThrowingTaskGroup(of: (String, ExitStatus?).self) { group in
                     for ctr in await self.sortedContainers() where ctr.status == .running {
                         let id = ctr.id
                         let signal = try Signal(requested ?? ctr.config.stopSignal ?? "SIGTERM")
@@ -478,6 +478,13 @@ public actor RuntimeService {
     /// A machine given a single container therefore goes down with it, which is
     /// what it did when a container had a machine to itself, and a machine
     /// holding several stays up for the rest.
+    ///
+    /// The answer comes once the container's exit is recorded, as a runtime's
+    /// StopContainer returns with the container exited, so a removal that
+    /// follows finds it stopped. The record is the exit handler's, which takes
+    /// the lock this stop holds while it waits for the process, so the wait for
+    /// the record is made after the lock is let go.
+    /// https://github.com/containerd/containerd/blob/main/internal/cri/server/container_stop.go
     @Sendable
     public func stopContainer(_ message: XPCMessage) async throws -> XPCMessage {
         self.log.debug("enter", metadata: ["func": "\(#function)"])
@@ -488,21 +495,31 @@ public actor RuntimeService {
         let signal = try Signal(stopOptions.signal ?? "SIGTERM")
         let timeout: Duration = .seconds(stopOptions.timeoutInSeconds)
 
-        return try await self.lock.withLock { _ in
+        let pending = try await self.lock.withLock { _ -> ObjectIdentifier? in
             // A container that is not running has nothing to stop; stopping
             // it again answers the same as the first time.
             guard try await self.getContainer(container.id).status == .running else {
-                return message.reply()
+                return nil
             }
             let sandbox = try await self.getSandbox()
-            _ = try await self.gracefulStopContainer(
-                sandbox,
-                id: container.config.id,
-                signal: signal,
-                timeout: timeout
-            )
-            return message.reply()
+            // A stop that failed leaves the process's state unknown, and
+            // nothing would answer a wait for its record.
+            guard
+                try await self.gracefulStopContainer(
+                    sandbox,
+                    id: container.config.id,
+                    signal: signal,
+                    timeout: timeout
+                ) != nil
+            else {
+                return nil
+            }
+            return await self.exitWaiterIdentity(for: container.config.id)
         }
+        if let pending {
+            await self.awaitRecordedExit(id: container.config.id, waiter: pending)
+        }
+        return message.reply()
     }
 
     /// Take a stopped container out of the machine: its block devices are
@@ -1846,7 +1863,10 @@ public actor RuntimeService {
         return container
     }
 
-    /// Stop one container in the sandbox and wait for it, then leave.
+    /// Stop one container in the sandbox and wait for it, then leave with how
+    /// its process ended: the signal first, and the kill once the timeout has
+    /// passed. A stop that fails answers nothing, since the process may still
+    /// be running.
     ///
     /// The machine stays up, since the sandbox's other containers are still in
     /// it. Powering it off is the sandbox's own stop.
@@ -1855,12 +1875,9 @@ public actor RuntimeService {
         id: String,
         signal: Signal,
         timeout: Duration
-    ) async throws -> ExitStatus {
-        // Try and gracefully shut down the process. Even if this succeeds we need to power off
-        // the vm, but we should try this first always.
-        var code = ExitStatus(exitCode: 255)
+    ) async throws -> ExitStatus? {
         do {
-            code = try await withThrowingTaskGroup(of: ExitStatus.self) { group in
+            return try await withThrowingTaskGroup(of: ExitStatus.self) { group in
                 group.addTask {
                     try await sandbox.waitContainer(id, timeoutInSeconds: nil)
                 }
@@ -1882,10 +1899,9 @@ public actor RuntimeService {
                 return code
             }
         } catch {
-            self.log.error("graceful stop failed; forcing vm shutdown", metadata: ["error": "\(error)"])
+            self.log.error("graceful stop failed", metadata: ["id": "\(id)", "error": "\(error)"])
+            return nil
         }
-
-        return code
     }
 
     /// What the registry records once a container's init process has gone,
@@ -2156,6 +2172,24 @@ extension RuntimeService {
 
     private func releaseWaiters(for id: String, status: ExitStatus) {
         waiters[id]?.doExit(exitStatus: status)
+    }
+
+    /// The waiter standing for the container's current process, named so a
+    /// wait made later can tell it from one a restart has put in its place.
+    private func exitWaiterIdentity(for id: String) -> ObjectIdentifier? {
+        waiters[id].map(ObjectIdentifier.init)
+    }
+
+    /// Wait until the exit the named waiter stands for is recorded. A waiter
+    /// that is no longer the container's was answered by that record already,
+    /// and one put in its place stands for another process.
+    private func awaitRecordedExit(id: String, waiter: ObjectIdentifier) async {
+        guard let current = waiters[id], ObjectIdentifier(current) == waiter else {
+            return
+        }
+        _ = await withCheckedContinuation { cc in
+            current.wait(cc)
+        }
     }
 
     private func setUnderlyingProcess(_ id: String, _ process: LinuxProcess) throws {
