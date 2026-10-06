@@ -90,6 +90,7 @@ struct ConfigurationLoaderTests {
             #expect(config.build.memory == BuildConfig.defaultMemory)
             #expect(config.container.cpus == 4)
             #expect(config.container.memory == ContainerConfig.defaultMemory)
+            #expect(config.container.blockDeviceDriver == .virtioBlock)
             #expect(config.dns.domain == nil)
             #expect(!config.build.image.isEmpty)
             #expect(!config.vminit.image.isEmpty)
@@ -114,6 +115,7 @@ struct ConfigurationLoaderTests {
                 [container]
                 cpus = 16
                 memory = "8g"
+                blockDeviceDriver = "virtio-scsi"
 
                 [dns]
                 domain = "custom"
@@ -144,6 +146,7 @@ struct ConfigurationLoaderTests {
             #expect(config.container.cpus == 16)
             let expectedContainerMemory = try MemorySize("8g")
             #expect(config.container.memory == expectedContainerMemory)
+            #expect(config.container.blockDeviceDriver == .virtioSCSI)
             #expect(config.dns.domain == "custom")
             #expect(config.build.image == "custom-builder:latest")
             #expect(config.vminit.image == "custom-init:latest")
@@ -174,6 +177,32 @@ struct ConfigurationLoaderTests {
             #expect(config.container.cpus == 4)
             #expect(config.container.memory == ContainerConfig.defaultMemory)
         }
+    }
+
+    @Test func unknownBlockDeviceDriverThrows() async throws {
+        try await TemporaryStorage.withTempDir { tempDir in
+            let toml = """
+                [container]
+                blockDeviceDriver = "nvdimm"
+                """
+            let tmpFile = tempDir.appending("test.toml")
+            try Self.writeToml(toml, to: tmpFile)
+
+            await #expect(throws: (any Error).self) {
+                let _: ContainerSystemConfig = try await ConfigurationLoader.load(configurationFiles: [tmpFile])
+            }
+        }
+    }
+
+    /// `container system property list` prints the configuration as it
+    /// encodes, so the driver is listed under its key with the other
+    /// container defaults.
+    @Test func blockDeviceDriverEncodesWithTheContainerDefaults() throws {
+        let config = ContainerSystemConfig(container: ContainerConfig(blockDeviceDriver: .virtioSCSI))
+        let encoded = try JSONSerialization.jsonObject(with: JSONEncoder().encode(config)) as? [String: Any]
+        let container = try #require(encoded?["container"] as? [String: Any])
+        #expect(container["blockDeviceDriver"] as? String == "virtio-scsi")
+        #expect(container["cpus"] as? Int == ContainerConfig.defaultCPUs)
     }
 
     @Test func customKernelURLWithoutDigestThrows() async throws {
