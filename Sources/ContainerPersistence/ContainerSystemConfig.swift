@@ -19,6 +19,8 @@ import ContainerVersion
 import ContainerizationExtras
 import Foundation
 
+import enum Containerization.BlockDeviceDriver
+
 /// Top-level configuration decoded from config.toml.
 ///
 /// Each section maps to a nested struct. Missing keys fall back to
@@ -124,15 +126,31 @@ final public class ContainerConfig: Codable, Sendable {
     /// No swap area, so a container stays within the memory it is given
     /// unless the operator asks for headroom beyond it.
     public static let defaultSwap = try! MemorySize("0")
+    /// Virtualization's own virtio block devices, which a machine cannot
+    /// take while it runs; virtio-scsi gives every container disk to the
+    /// machine's one SCSI host instead, which takes and gives back disks while
+    /// the machine runs and needs macOS 27. Kata sets the same choice for
+    /// each sandbox it runs:
+    /// https://github.com/kata-containers/kata-containers/blob/ea7aba03b1d48813cae07413c95ab6bc464b7a5f/src/runtime/config/configuration-qemu.toml.in#L210-L213
+    public static let defaultBlockDeviceDriver: BlockDeviceDriver = .virtioBlock
 
     public let cpus: Int
     public let memory: MemorySize
     public let swap: MemorySize
+    /// The driver a container's machine attaches the container's disks on,
+    /// for a pod and a container's own machine alike.
+    public let blockDeviceDriver: BlockDeviceDriver
 
-    public init(cpus: Int = defaultCPUs, memory: MemorySize = defaultMemory, swap: MemorySize = defaultSwap) {
+    public init(
+        cpus: Int = defaultCPUs,
+        memory: MemorySize = defaultMemory,
+        swap: MemorySize = defaultSwap,
+        blockDeviceDriver: BlockDeviceDriver = defaultBlockDeviceDriver
+    ) {
         self.cpus = cpus
         self.memory = memory
         self.swap = swap
+        self.blockDeviceDriver = blockDeviceDriver
     }
 
     public init(from decoder: any Decoder) throws {
@@ -140,6 +158,9 @@ final public class ContainerConfig: Codable, Sendable {
         self.cpus = try container.decodeIfPresent(Int.self, forKey: .cpus) ?? Self.defaultCPUs
         self.memory = try container.decodeIfPresent(MemorySize.self, forKey: .memory) ?? Self.defaultMemory
         self.swap = try container.decodeIfPresent(MemorySize.self, forKey: .swap) ?? Self.defaultSwap
+        self.blockDeviceDriver =
+            try container.decodeIfPresent(BlockDeviceDriver.self, forKey: .blockDeviceDriver)
+            ?? Self.defaultBlockDeviceDriver
     }
 }
 
