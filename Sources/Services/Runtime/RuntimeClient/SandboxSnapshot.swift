@@ -16,17 +16,38 @@
 
 import ContainerResource
 
+/// Where a sandbox's machine is in its life.
+///
+/// A sandbox has a state of its own, apart from the containers in it: the
+/// runtime interface reports a sandbox ready or not ready and each container
+/// created, running or exited, and a sandbox is ready from the moment it is
+/// brought up, holding no container yet. The phases here are the machine's,
+/// and `ready` is the one in which it takes and runs containers.
+/// https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
+public enum SandboxStatus: String, Codable, Sendable {
+    /// The service is up and the machine is waiting to be booted.
+    case created
+    /// The machine is booted and takes containers.
+    case ready
+    /// The machine is on its way down.
+    case stopping
+    /// The machine has stopped.
+    case stopped
+    /// The service is exiting; nothing boots again under it.
+    case shuttingDown
+}
+
 /// A snapshot of a sandbox and its resources.
 public struct SandboxSnapshot: Codable, Sendable {
-    /// The runtime status of the sandbox.
-    public var status: RuntimeStatus
+    /// Where the sandbox's machine is in its life.
+    public var status: SandboxStatus
     /// Network attachments for the sandbox.
     public var networks: [Attachment]
-    /// Containers placed in the sandbox.
+    /// Containers placed in the sandbox, each with its own status.
     public var containers: [ContainerSnapshot]
 
     public init(
-        status: RuntimeStatus,
+        status: SandboxStatus,
         networks: [Attachment],
         containers: [ContainerSnapshot]
     ) {

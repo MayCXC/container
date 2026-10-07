@@ -32,25 +32,6 @@ import Logging
 import SystemPackage
 
 public actor ContainersService {
-    struct ContainerState {
-        var snapshot: ContainerSnapshot
-        var client: RuntimeClient? = nil
-
-        func getClient() throws -> RuntimeClient {
-            guard let client else {
-                var message = "no runtime client exists"
-                if snapshot.status == .stopped {
-                    message += ": container is stopped"
-                }
-                throw ContainerizationError(.invalidState, message: message)
-            }
-            return client
-        }
-    }
-
-    private static let machServicePrefix = "com.apple.container"
-    private static let launchdDomainString = try! ServiceManager.getDomainString()
-
     private let log: Logger
     private let debugHelpers: Bool
     private let containerRoot: URL
@@ -60,10 +41,16 @@ public actor ContainersService {
     private let containerSystemConfig: ContainerSystemConfig
 
     private let lock: AsyncLock
-    private var containers: [String: ContainerState]
+    /// The containers the control plane knows, each as its snapshot: what it
+    /// is made of and the state it is in. A container holds no connection of
+    /// its own; it is reached through its pod's machine, whose client the pods
+    /// service holds for as long as the machine answers, so a route finds the
+    /// current one at the moment of the call (`client(for:)`).
+    private var containers: [String: ContainerSnapshot]
 
     // FIXME: Find a better mechanism for services running on the APIServer to work with each other
     private weak var networksService: NetworksService?
+    private weak var podsService: PodsService?
 
     public init(
         appRoot: URL,
@@ -85,11 +72,21 @@ public actor ContainersService {
         self.containers = try Self.loadAtBoot(root: containerRoot, loader: pluginLoader, log: log)
     }
 
+    /// Where a container keeps what it is made of, which the pod it belongs
+    /// to hands the runtime when placing it in the machine.
+    public func path(for id: String) -> URL {
+        self.containerRoot.appendingPathComponent(id)
+    }
+
+    public func setPodsService(_ service: PodsService) async {
+        self.podsService = service
+    }
+
     public func setNetworksService(_ service: NetworksService) async {
         self.networksService = service
     }
 
-    static func loadAtBoot(root: URL, loader: PluginLoader, log: Logger) throws -> [String: ContainerState] {
+    static func loadAtBoot(root: URL, loader: PluginLoader, log: Logger) throws -> [String: ContainerSnapshot] {
         var directories = try FileManager.default.contentsOfDirectory(
             at: root,
             includingPropertiesForKeys: [.isDirectoryKey]
@@ -99,48 +96,16 @@ public actor ContainersService {
         }
 
         let runtimePlugins = loader.findPlugins().filter { $0.hasType(.runtime) }
-        var results = [String: ContainerState]()
+        var results = [String: ContainerSnapshot]()
         for dir in directories {
             do {
-                let (config, options) = try Self.getContainerConfiguration(at: dir)
-                if options?.autoRemove ?? false {
-                    log.info(
-                        "reap auto-remove container",
-                        metadata: [
-                            "id": "\(config.id)"
-                        ])
-
-                    let label = Self.fullLaunchdServiceLabel(
-                        runtimeName: config.runtimeHandler,
-                        instanceId: config.id)
-
-                    var status: Int32 = -1
-                    try? ServiceManager.deregister(fullServiceLabel: label, status: &status)
-                    if status != 0 {
-                        log.warning(
-                            "failed to deregister service",
-                            metadata: [
-                                "id": "\(config.id)",
-                                "service": "\(label)",
-                                "status": "\(status)",
-                            ]
-                        )
-                    }
-
-                    let bundle = ContainerResource.Bundle(path: dir)
-                    try? bundle.delete()
-                    continue
-                }
-
-                let state = ContainerState(
-                    snapshot: .init(
-                        configuration: config,
-                        status: .stopped,
-                        networks: [],
-                        startedDate: nil
-                    ),
+                let (config, _) = try Self.getContainerConfiguration(at: dir)
+                results[config.id] = ContainerSnapshot(
+                    configuration: config,
+                    status: .stopped,
+                    networks: [],
+                    startedDate: nil
                 )
-                results[config.id] = state
                 // A missing plugin says nothing about the container: the
                 // loader's answer varies with how this process was spawned,
                 // and a bundle outlives any one spawn. Removal is reserved
@@ -164,6 +129,32 @@ public actor ContainersService {
             }
         }
         return results
+    }
+
+    /// Remove every container run to be removed on exit that is not running.
+    ///
+    /// Such a container is removed as its exit is handled, but an exit that
+    /// came while no control plane was serving reached nobody, and the
+    /// container is still written down along with the pod it was given. It
+    /// is removed now the way its exit would have removed it, which takes
+    /// that pod with it, so this runs once the pods service is there to be
+    /// asked and before the server listens.
+    public func reapAutoRemoveContainers() async {
+        await self.lock.withLock(logMetadata: ["acquirer": "\(#function)"]) { context in
+            for (id, state) in await self.containers where state.status != .running {
+                guard (try? await self.getContainerCreationOptions(id: id))?.autoRemove == true else {
+                    continue
+                }
+                self.log.info("reap auto-remove container", metadata: ["id": "\(id)"])
+                do {
+                    try await self.cleanUp(id: id, context: context)
+                } catch {
+                    self.log.warning(
+                        "failed to reap auto-remove container",
+                        metadata: ["id": "\(id)", "error": "\(error)"])
+                }
+            }
+        }
     }
 
     /// List containers matching the given filters.
@@ -193,9 +184,7 @@ public actor ContainersService {
             }
         }
 
-        return self.containers.values.compactMap { state -> ContainerSnapshot? in
-            let snapshot = state.snapshot
-
+        return self.containers.values.compactMap { snapshot -> ContainerSnapshot? in
             if !filters.ids.isEmpty {
                 guard filters.ids.contains(snapshot.id) else {
                     return nil
@@ -227,14 +216,51 @@ public actor ContainersService {
         _ operation: @Sendable @escaping ([ContainerSnapshot]) async throws -> T
     ) async throws -> T {
         try await lock.withLock(logMetadata: logMetadata) { context in
-            let snapshots = await self.containers.values.map { $0.snapshot }
+            let snapshots = Array(await self.containers.values)
             return try await operation(snapshots)
         }
     }
 
+    /// The name of every volume a container mounts, gathered inside the
+    /// containers lock so no container is created into the answer.
+    public func volumeNamesInUse() async throws -> Set<String> {
+        try await withContainerList(logMetadata: ["acquirer": "\(#function)"]) { containers in
+            var names = Set<String>()
+            for container in containers {
+                for mount in container.configuration.mounts {
+                    if mount.isVolume, let volumeName = mount.volumeName {
+                        names.insert(volumeName)
+                    }
+                }
+            }
+            return names
+        }
+    }
+
+    /// The containers that mount the named volume, gathered inside the
+    /// containers lock. An empty answer says the volume was free when asked,
+    /// which is the strongest claim one resource can make about another from
+    /// outside the other's lock.
+    public func containersReferencingVolume(_ name: String) async throws -> [String] {
+        try await withContainerList(logMetadata: ["acquirer": "\(#function)", "name": "\(name)"]) { containers in
+            containers.filter { container in
+                container.configuration.mounts.contains { $0.isVolume && $0.volumeName == name }
+            }.map { $0.configuration.id }
+        }
+    }
+
+    /// The containers attached to the named network, gathered inside the
+    /// containers lock.
+    public func containersAttachedToNetwork(_ id: String) async throws -> [String] {
+        try await withContainerList(logMetadata: ["acquirer": "\(#function)", "id": "\(id)"]) { containers in
+            containers.filter { container in
+                container.configuration.networks.contains { $0.network == id }
+            }.map { $0.configuration.id }
+        }
+    }
+
     /// Calculate disk usage for containers
-    /// - Returns: Tuple of (total count, active count, total size, reclaimable size)
-    public func calculateDiskUsage() async -> (Int, Int, UInt64, UInt64) {
+    public func calculateDiskUsage() async -> ResourceUsage {
         await lock.withLock(logMetadata: ["acquirer": "\(#function)"]) { _ in
             var totalSize: UInt64 = 0
             var reclaimableSize: UInt64 = 0
@@ -245,7 +271,7 @@ public actor ContainersService {
                 let containerSize = FileManager.default.allocatedSize(of: bundlePath)
                 totalSize += containerSize
 
-                if state.snapshot.status == .running {
+                if state.status == .running {
                     activeCount += 1
                 } else {
                     // Stopped containers are reclaimable
@@ -253,7 +279,12 @@ public actor ContainersService {
                 }
             }
 
-            return (await self.containers.count, activeCount, totalSize, reclaimableSize)
+            return ResourceUsage(
+                total: await self.containers.count,
+                active: activeCount,
+                sizeInBytes: totalSize,
+                reclaimable: reclaimableSize
+            )
         }
     }
 
@@ -263,7 +294,7 @@ public actor ContainersService {
         await lock.withLock(logMetadata: ["acquirer": "\(#function)"]) { _ in
             var imageRefs = Set<String>()
             for (_, state) in await self.containers {
-                imageRefs.insert(state.snapshot.configuration.image.reference)
+                imageRefs.insert(state.configuration.image.reference)
             }
             return imageRefs
         }
@@ -298,7 +329,7 @@ public actor ContainersService {
 
             var allHostnames = Set<String>()
             for container in await self.containers.values {
-                for attachmentConfiguration in container.snapshot.configuration.networks {
+                for attachmentConfiguration in container.configuration.networks {
                     allHostnames.insert(attachmentConfiguration.options.hostname)
                 }
             }
@@ -349,7 +380,25 @@ public actor ContainersService {
                     "id": "\(configuration.id)"
                 ]
             )
-            let initFilesystem = try await self.getInitBlock(for: systemPlatform.ociPlatform(), imageRef: initImage)
+            let (initFilesystem, initDescription) = try await self.getInitBlock(for: systemPlatform.ociPlatform(), imageRef: initImage)
+
+            guard let podsService = await self.podsService else {
+                throw ContainerizationError(.internalError, message: "no pod service to make pod \(configuration.pod)")
+            }
+            do {
+                var podConfiguration = PodConfiguration(sandboxFor: configuration)
+                podConfiguration.initImage = initDescription
+                try await podsService.create(
+                    configuration: podConfiguration,
+                    kernel: kernel,
+                    initialFilesystem: initFilesystem
+                )
+            } catch let error as ContainerizationError {
+                guard error.code == .exists else {
+                    throw error
+                }
+                // The pod is already there, and the container joins it.
+            }
 
             do {
                 self.log.debug(
@@ -386,14 +435,26 @@ public actor ContainersService {
                     networks: [],
                     startedDate: nil
                 )
-                await self.setContainerState(configuration.id, ContainerState(snapshot: snapshot), context: context)
+                await self.setContainerState(configuration.id, snapshot, context: context)
             } catch {
+                // The pod goes with the container it was made for.
+                await podsService.removeIfAnonymous(id: configuration.pod)
                 throw error
             }
         }
     }
 
-    /// Bootstrap the init process of the container.
+    /// Place the container in its pod's machine, booting the machine when it
+    /// is down.
+    ///
+    /// A container is in the pod's machine, so it has no machine of its own to
+    /// register and reaches the one it shares through the pod. It asks for the
+    /// pod to run with it in it, which is one call for the container that
+    /// brings the machine up and the container that finds it up already. A
+    /// container the machine already holds is left as it is by the runtime,
+    /// so asking twice costs a round trip and changes nothing, and nothing is
+    /// written down here to be consulted in its place: the machine is the
+    /// record of what it holds.
     public func bootstrap(id: String, stdio: [FileHandle?], dynamicEnv: [String: String]) async throws {
         log.debug(
             "ContainersService: enter",
@@ -414,60 +475,44 @@ public actor ContainersService {
         }
 
         try await self.lock.withLock(logMetadata: ["acquirer": "\(#function)", "id": "\(id)"]) { context in
-            var state = try await self.getContainerState(id: id, context: context)
-
-            // We've already bootstrapped this container. Ideally we should be able to
-            // return some sort of error code from the sandbox svc to check here, but this
-            // is also a very simple check and faster than doing an rpc to get the same result.
-            if state.client != nil {
-                return
+            let state = try await self.getContainerState(id: id, context: context)
+            let pod = state.configuration.pod
+            guard let podsService = await self.podsService else {
+                throw ContainerizationError(.internalError, message: "no pod service to reach pod \(pod)")
             }
-
-            let path = self.containerRoot.appendingPathComponent(id)
-            let (config, _) = try Self.getContainerConfiguration(at: path)
-
-            var networkBootstrapInfos = [NetworkBootstrapInfo]()
-            for n in config.networks {
-                guard let plugin = try await self.networksService?.plugin(for: n.network) else {
-                    throw ContainerizationError(.internalError, message: "failed to get plugin for network \(n.network)")
-                }
-                networkBootstrapInfos.append(NetworkBootstrapInfo(plugin: plugin))
-            }
-
-            do {
-                try Self.registerService(
-                    plugin: self.runtimePlugins.first { $0.name == config.runtimeHandler }!,
-                    loader: self.pluginLoader,
-                    configuration: config,
-                    path: path,
-                    debug: self.debugHelpers
-                )
-
-                let runtime = state.snapshot.configuration.runtimeHandler
-                let runtimeClient = try await RuntimeClient.create(
-                    id: id,
-                    runtime: runtime
-                )
-                try await runtimeClient.bootstrap(stdio: stdio, networkBootstrapInfos: networkBootstrapInfos, dynamicEnv: dynamicEnv)
-
-                try await self.exitMonitor.registerProcess(
-                    id: id,
-                    onExit: self.handleContainerExit
-                )
-
-                state.client = runtimeClient
-                await self.setContainerState(id, state, context: context)
-            } catch {
-                let label = Self.fullLaunchdServiceLabel(
-                    runtimeName: config.runtimeHandler,
-                    instanceId: id
-                )
-
-                await self.exitMonitor.stopTracking(id: id)
-                try? ServiceManager.deregister(fullServiceLabel: label)
-                throw error
-            }
+            try await podsService.start(
+                id: pod,
+                container: id,
+                startup: PodsService.ContainerStartup(stdio: stdio, dynamicEnv: dynamicEnv)
+            )
         }
+    }
+
+    /// The client a route reaches a running container through: its pod's,
+    /// addressing the container.
+    ///
+    /// A container holds no connection of its own. Its machine is the pod's,
+    /// and the pods service holds that machine's client for as long as the
+    /// machine answers, so the connection a route uses is the one current at
+    /// the moment of the call; a connection kept per container would outlive
+    /// the machine it was made for. The runtime interface addresses every
+    /// container call by id over the runtime's one connection the same way.
+    /// https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
+    private func client(for id: String) async throws -> RuntimeClient {
+        let state = try self._getContainerState(id: id)
+        guard state.status == .running else {
+            throw ContainerizationError(.invalidState, message: "container \(id) is not running")
+        }
+        return try await self.podClient(for: state.configuration.pod, member: id)
+    }
+
+    /// The pod's client addressing one of its members, for the route that
+    /// reaches a member before it runs: its start.
+    private func podClient(for pod: String, member id: String) async throws -> RuntimeClient {
+        guard let podsService = self.podsService else {
+            throw ContainerizationError(.internalError, message: "no pod service to reach pod \(pod)")
+        }
+        return try await podsService.client(for: pod).addressing(id)
     }
 
     /// Create a new process in the container.
@@ -496,8 +541,7 @@ public actor ContainersService {
             )
         }
 
-        let state = try self._getContainerState(id: id)
-        let client = try state.getClient()
+        let client = try await self.client(for: id)
         try await client.createProcess(
             processID,
             config: config,
@@ -532,11 +576,14 @@ public actor ContainersService {
             var state = try await self.getContainerState(id: id, context: context)
 
             let isInit = Self.isInitProcess(id: id, processID: processID)
-            if state.snapshot.status == .running && isInit {
+            if state.status == .running && isInit {
                 return
             }
 
-            let client = try state.getClient()
+            // The container's init is started before it runs, so the pod's
+            // client is taken directly rather than through `client(for:)`,
+            // which answers for running containers.
+            let client = try await self.podClient(for: state.configuration.pod, member: id)
             try await client.startProcess(processID)
 
             guard isInit else {
@@ -545,6 +592,10 @@ public actor ContainersService {
 
             do {
                 let log = self.log
+                try await self.exitMonitor.registerProcess(
+                    id: id,
+                    onExit: self.handleContainerExit
+                )
                 let waitFunc: ExitMonitor.WaitHandler = {
                     log.info("registering container with exit monitor")
                     let code = try await client.wait(id)
@@ -560,14 +611,76 @@ public actor ContainersService {
                 try await self.exitMonitor.track(id: id, waitingOn: waitFunc)
 
                 let sandboxSnapshot = try await client.state()
-                state.snapshot.status = .running
-                state.snapshot.networks = sandboxSnapshot.networks
-                state.snapshot.startedDate = Date()
+                state.status = .running
+                state.networks = sandboxSnapshot.networks
+                state.startedDate = Date()
                 await self.setContainerState(id, state, context: context)
             } catch {
+                // What failed is this container's bookkeeping, after its init
+                // started; the container is stopped again, and the machine it
+                // shares is left to its other containers.
                 await self.exitMonitor.stopTracking(id: id)
-                try? await client.stop(options: ContainerStopOptions.default)
+                try? await client.stopContainer(options: ContainerStopOptions.default)
                 throw error
+            }
+        }
+    }
+
+    /// Adopt the containers the reconnected machines report.
+    ///
+    /// The machines a restarted control plane finds alive were dialed by the
+    /// pods service; each reports the containers it holds and their state.
+    /// A container the machine says is running is adopted as running, and the
+    /// exit monitor tracks it again through the pod's client the way its start
+    /// tracked it first, so its exit is handled by whoever is serving when it
+    /// comes, removing it when it was run to be removed on exit.
+    public func reconnect() async {
+        guard let podsService = self.podsService else {
+            return
+        }
+        await self.lock.withLock(logMetadata: ["acquirer": "\(#function)"]) { context in
+            for (id, var state) in await self.containers {
+                guard state.status != .running else {
+                    continue
+                }
+                let pod = state.configuration.pod
+                guard let podClient = try? await podsService.client(for: pod) else {
+                    continue
+                }
+                let client = podClient.addressing(id)
+                guard let sandbox = try? await client.state(),
+                    let reported = sandbox.containers.first(where: { $0.id == id }),
+                    reported.status == .running
+                else {
+                    continue
+                }
+                do {
+                    let log = self.log
+                    try await self.exitMonitor.registerProcess(
+                        id: id,
+                        onExit: self.handleContainerExit
+                    )
+                    let waitFunc: ExitMonitor.WaitHandler = {
+                        let code = try await client.wait(id)
+                        log.info(
+                            "container finished in exit monitor",
+                            metadata: [
+                                "id": "\(id)",
+                                "rc": "\(code)",
+                            ])
+                        return code
+                    }
+                    try await self.exitMonitor.track(id: id, waitingOn: waitFunc)
+                    state.status = .running
+                    state.networks = sandbox.networks
+                    state.startedDate = reported.startedDate
+                    await self.setContainerState(id, state, context: context)
+                    self.log.info("adopted a running container", metadata: ["id": "\(id)", "pod": "\(pod)"])
+                } catch {
+                    self.log.warning(
+                        "failed to adopt a running container",
+                        metadata: ["id": "\(id)", "error": "\(error)"])
+                }
             }
         }
     }
@@ -594,8 +707,7 @@ public actor ContainersService {
             )
         }
 
-        let state = try self._getContainerState(id: id)
-        let client = try state.getClient()
+        let client = try await self.client(for: id)
         try await client.kill(processID, signal: signal)
 
         // SIGKILL is guaranteed to terminate the target. When directed at the
@@ -628,24 +740,31 @@ public actor ContainersService {
 
         let state = try self._getContainerState(id: id)
 
-        // Stop should be idempotent.
-        let client: RuntimeClient
-        do {
-            client = try state.getClient()
-        } catch {
+        // Stop is idempotent: a container that is not running has nothing to
+        // stop.
+        guard state.status == .running else {
             return
         }
 
         var resolvedOptions = options
-        if resolvedOptions.signal == nil, let stopSignal = state.snapshot.configuration.stopSignal {
+        if resolvedOptions.signal == nil, let stopSignal = state.configuration.stopSignal {
             resolvedOptions.signal = stopSignal
         }
 
-        do {
-            try await client.stop(options: resolvedOptions)
-        } catch let err as ContainerizationError {
-            if err.code != .interrupted {
-                throw err
+        // Stopping a container stops that container. The machine it runs in
+        // is stopped by its own call, whether it holds one container or
+        // several, so nothing here decides the machine's fate on a
+        // container's behalf. A machine that is gone, or goes while it is
+        // asked, has stopped the container already, and what is left to settle
+        // is the record.
+        // https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
+        if let client = try? await self.client(for: id) {
+            do {
+                try await client.stopContainer(options: resolvedOptions)
+            } catch let err as ContainerizationError {
+                if err.code != .interrupted {
+                    throw err
+                }
             }
         }
         try await handleContainerExit(id: id)
@@ -671,8 +790,7 @@ public actor ContainersService {
             )
         }
 
-        let state = try self._getContainerState(id: id)
-        let client = try state.getClient()
+        let client = try await self.client(for: id)
         return try await client.dial(port)
     }
 
@@ -698,8 +816,7 @@ public actor ContainersService {
             )
         }
 
-        let state = try self._getContainerState(id: id)
-        let client = try state.getClient()
+        let client = try await self.client(for: id)
         return try await client.wait(processID)
     }
 
@@ -724,8 +841,7 @@ public actor ContainersService {
             )
         }
 
-        let state = try self._getContainerState(id: id)
-        let client = try state.getClient()
+        let client = try await self.client(for: id)
         try await client.resize(processID, size: size)
     }
 
@@ -748,17 +864,25 @@ public actor ContainersService {
             )
         }
 
-        // Logs doesn't care if the container is running or not, just that
-        // the bundle is there, and that the files actually exist. We do
-        // first try and get the container state so we get a nicer error message
+        // Logs doesn't care if the container is running or not, just that the
+        // bundles are there and the files exist. What the container itself
+        // wrote is its own bundle's; the boot it came up on belongs to the
+        // machine the pod runs, so the pod is asked for that one. We do first
+        // try and get the container state so we get a nicer error message
         // (container foo not found) however.
         do {
-            _ = try _getContainerState(id: id)
+            let state = try _getContainerState(id: id)
             let path = self.containerRoot.appendingPathComponent(id)
             let bundle = ContainerResource.Bundle(path: path)
+            guard let podsService = self.podsService else {
+                throw ContainerizationError(
+                    .internalError,
+                    message: "no pod service to reach the machine running \(id)"
+                )
+            }
             return [
                 try FileHandle(forReadingFrom: bundle.containerLog),
-                try FileHandle(forReadingFrom: bundle.bootlog),
+                try await podsService.bootLog(for: state.configuration.pod),
             ]
         } catch {
             throw ContainerizationError(
@@ -772,11 +896,7 @@ public actor ContainersService {
     public func copyIn(id: String, source: String, destination: String, mode: UInt32, createParents: Bool = true) async throws {
         self.log.debug("\(#function)")
 
-        let state = try self._getContainerState(id: id)
-        guard state.snapshot.status == .running else {
-            throw ContainerizationError(.invalidState, message: "container \(id) is not running")
-        }
-        let client = try state.getClient()
+        let client = try await self.client(for: id)
         try await client.copyIn(source: source, destination: destination, mode: mode, createParents: createParents)
     }
 
@@ -784,11 +904,7 @@ public actor ContainersService {
     public func copyOut(id: String, source: String, destination: String, createParents: Bool = true) async throws {
         self.log.debug("\(#function)")
 
-        let state = try self._getContainerState(id: id)
-        guard state.snapshot.status == .running else {
-            throw ContainerizationError(.invalidState, message: "container \(id) is not running")
-        }
-        let client = try state.getClient()
+        let client = try await self.client(for: id)
         try await client.copyOut(source: source, destination: destination, createParents: createParents)
     }
 
@@ -811,8 +927,7 @@ public actor ContainersService {
             )
         }
 
-        let state = try self._getContainerState(id: id)
-        let client = try state.getClient()
+        let client = try await self.client(for: id)
         return try await client.statistics()
     }
 
@@ -837,20 +952,27 @@ public actor ContainersService {
         }
 
         let state = try self._getContainerState(id: id)
-        switch state.snapshot.status {
+        switch state.status {
         case .running:
             if !force {
                 throw ContainerizationError(
                     .invalidState,
-                    message: "container \(id) is \(state.snapshot.status) and can not be deleted"
+                    message: "container \(id) is \(state.status) and can not be deleted"
                 )
             }
             let opts = ContainerStopOptions(
                 timeoutInSeconds: 5,
                 signal: "SIGKILL"
             )
-            let client = try state.getClient()
-            try await client.stop(options: opts)
+            // Removing a container removes that container; the machine it
+            // shares is not this call's to stop. A machine nobody named goes
+            // down with the last container in it; one that was named stays up
+            // for the pod's own stop. A machine that is gone has stopped the
+            // container already.
+            // https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
+            if let client = try? await self.client(for: id) {
+                try await client.stopContainer(options: opts)
+            }
             try await self.lock.withLock(logMetadata: ["acquirer": "\(#function)", "id": "\(id)"]) { context in
                 self.log.info(
                     "ContainersService: attempt cleanup",
@@ -871,7 +993,7 @@ public actor ContainersService {
         case .stopping:
             throw ContainerizationError(
                 .invalidState,
-                message: "container \(id) is \(state.snapshot.status) and can not be deleted"
+                message: "container \(id) is \(state.status) and can not be deleted"
             )
         default:
             try await self.lock.withLock(logMetadata: ["acquirer": "\(#function)", "id": "\(id)"]) { context in
@@ -911,9 +1033,9 @@ public actor ContainersService {
         let bundle = ContainerResource.Bundle(path: path)
         let rootfs = bundle.containerRootfsBlock
 
-        switch state.snapshot.status {
+        switch state.status {
         case .running:
-            let client = try state.getClient()
+            let client = try await self.client(for: id)
             let snapshot = rootfs.appendingPathExtension("snapshot")
             defer { try? FileManager.default.removeItem(at: snapshot) }
             try await client.snapshotDisk(imagePath: rootfs.path, destinationPath: snapshot.path)
@@ -928,12 +1050,7 @@ public actor ContainersService {
     public func clean(id: String) async throws {
         self.log.debug("\(#function)")
 
-        let state = try self._getContainerState(id: id)
-        guard state.snapshot.status == .running else {
-            throw ContainerizationError(.invalidState, message: "container is not running")
-        }
-
-        let client = try state.getClient()
+        let client = try await self.client(for: id)
         try await client.clean(id: id)
     }
 
@@ -953,10 +1070,10 @@ public actor ContainersService {
                 ])
         }
 
-        var state: ContainerState
+        var state: ContainerSnapshot
         do {
             state = try self.getContainerState(id: id, context: context)
-            if state.snapshot.status == .stopped {
+            if state.status == .stopped {
                 return
             }
         } catch {
@@ -966,61 +1083,19 @@ public actor ContainersService {
 
         await self.exitMonitor.stopTracking(id: id)
 
-        // Shutdown and deregister the runtime service
-        self.log.info("shutting down runtime service", metadata: ["id": "\(id)"])
+        // A container's exit is the container's alone. The machine it shared
+        // stops itself once the last container in it is gone, and its service
+        // is the pod's, deregistered when the pod is deleted; a machine other
+        // containers still run in is not touched at all.
 
-        let path = self.containerRoot.appendingPathComponent(id)
-        let bundle = ContainerResource.Bundle(path: path)
-        let config = try bundle.configuration
-        let label = Self.fullLaunchdServiceLabel(
-            runtimeName: config.runtimeHandler,
-            instanceId: id
-        )
-
-        // Try to shutdown the client gracefully, but if the runtime service
-        // is already dead (e.g., killed externally), we should still continue
-        // with state cleanup.
-        if let client = state.client {
-            do {
-                try await client.shutdown()
-            } catch {
-                self.log.error(
-                    "failed to shutdown runtime service",
-                    metadata: [
-                        "id": "\(id)",
-                        "error": "\(error)",
-                    ])
-            }
-        }
-
-        // Deregister the service, launchd will terminate the process.
-        // This may also fail if the service was already deregistered or
-        // the process was killed externally.
-        do {
-            try ServiceManager.deregister(fullServiceLabel: label)
-            self.log.info("deregistered runtime service", metadata: ["id": "\(id)"])
-        } catch {
-            self.log.error(
-                "failed to deregister runtime service",
-                metadata: [
-                    "id": "\(id)",
-                    "error": "\(error)",
-                ])
-        }
-
-        state.snapshot.status = .stopped
-        state.snapshot.networks = []
-        state.client = nil
+        state.status = .stopped
+        state.networks = []
         await self.setContainerState(id, state, context: context)
 
         let options = try getContainerCreationOptions(id: id)
         if options.autoRemove {
             try await self.cleanUp(id: id, context: context)
         }
-    }
-
-    private static func fullLaunchdServiceLabel(runtimeName: String, instanceId: String) -> String {
-        "\(Self.launchdDomainString)/\(Self.machServicePrefix).\(runtimeName).\(instanceId)"
     }
 
     private func _cleanUp(id: String) async throws {
@@ -1052,30 +1127,21 @@ public actor ContainersService {
         await self.exitMonitor.stopTracking(id: id)
         let path = self.containerRoot.appendingPathComponent(id)
 
-        // Try to get config for service deregistration
-        // Don't fail if bundle is incomplete
-        var config: ContainerConfiguration?
         let bundle = ContainerResource.Bundle(path: path)
-        do {
-            config = try bundle.configuration
-        } catch {
-            self.log.warning(
-                "failed to read bundle configuration during cleanup for container",
-                metadata: [
-                    "id": "\(id)",
-                    "error": "\(error)",
-                ])
-        }
+        // Which machine this container runs in, read the way a container's
+        // configuration is read anywhere it may not have started yet: from its
+        // bundle, and from the runtime configuration when the bundle holds
+        // nothing, since a container that was made and never started has its
+        // configuration only there.
+        let pod = try? Self.getContainerConfiguration(at: path).0.pod
 
-        // Only try to deregister service if we have a valid config
-        // TODO: Change this so we don't have to reread the config
-        // possibly store the container ID to service label mapping
-        if let config = config {
-            let label = Self.fullLaunchdServiceLabel(
-                runtimeName: config.runtimeHandler,
-                instanceId: id
-            )
-            try? ServiceManager.deregister(fullServiceLabel: label)
+        // A machine that is up keeps a stopped container's place, its root
+        // filesystem attached, until the container is removed from it; the
+        // bundle holding that filesystem goes only once the machine has let
+        // it go. A pod whose machine is down holds no place to give up.
+        // https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
+        if let pod, let client = try? await self.podClient(for: pod, member: id) {
+            try await client.removeContainer()
         }
 
         // Always try to delete the bundle directory, even if it's incomplete
@@ -1091,6 +1157,19 @@ public actor ContainersService {
         }
 
         self.containers.removeValue(forKey: id)
+
+        // A container took its machine down as it was removed, when the machine
+        // was its own. A pod nobody named holds the machine in its place, so it
+        // goes here too; a pod someone named was not given to this container
+        // and stays.
+        //
+        // The container is out of the pod above before the pod is asked to go,
+        // because a pod removes the containers it still holds as it goes, and
+        // asked while this one was still in it the pod would ask for it to be
+        // removed, which asks for the lock this cleanup already holds.
+        if let pod {
+            await self.podsService?.removeIfAnonymous(id: pod)
+        }
     }
 
     private func cleanUp(id: String, context: AsyncLock.Context) async throws {
@@ -1104,12 +1183,12 @@ public actor ContainersService {
         return options
     }
 
-    private func getInitBlock(for platform: Platform, imageRef: String? = nil) async throws -> Filesystem {
+    private func getInitBlock(for platform: Platform, imageRef: String? = nil) async throws -> (Filesystem, ImageDescription) {
         let ref = imageRef ?? containerSystemConfig.vminit.image
         let initImage = try await ClientImage.fetch(reference: ref, platform: platform, containerSystemConfig: containerSystemConfig)
         var fs = try await initImage.getCreateSnapshot(platform: platform)
         fs.options = ["ro"]
-        return fs
+        return (fs, initImage.description)
     }
 
     private static func registerService(
@@ -1133,15 +1212,15 @@ public actor ContainersService {
         )
     }
 
-    private func setContainerState(_ id: String, _ state: ContainerState, context: AsyncLock.Context) async {
+    private func setContainerState(_ id: String, _ state: ContainerSnapshot, context: AsyncLock.Context) async {
         self.containers[id] = state
     }
 
-    private func getContainerState(id: String, context: AsyncLock.Context) throws -> ContainerState {
+    private func getContainerState(id: String, context: AsyncLock.Context) throws -> ContainerSnapshot {
         try self._getContainerState(id: id)
     }
 
-    private func _getContainerState(id: String) throws -> ContainerState {
+    private func _getContainerState(id: String) throws -> ContainerSnapshot {
         let state = self.containers[id]
         guard let state else {
             throw ContainerizationError(
