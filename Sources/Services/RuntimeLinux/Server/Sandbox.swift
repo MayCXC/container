@@ -83,6 +83,9 @@ protocol Sandbox: Sendable {
     /// Ask the guest to hold itself to a memory size, which the machine's
     /// containers share.
     func setTargetMemorySize(_ bytes: UInt64) async throws
+
+    /// The disk images the machine holds, by host path, until it stops.
+    func heldDiskImages() async -> [String]
 }
 
 /// A pod already addresses its containers by name, so it is a sandbox as it

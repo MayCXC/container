@@ -435,8 +435,8 @@ public actor PodsService {
             var stoodDown = false
             while true {
                 var running = state.client
-                // The containers the running machine holds, by its own word.
-                var machineHolds: [String] = []
+                // The disk images the running machine holds, by its own word.
+                var machineHolds: Set<String> = []
 
                 // A machine can be gone while the service that ran it lingers:
                 // stopped out of band, crashed, or torn down without the pod
@@ -467,7 +467,7 @@ public actor PodsService {
                         await self.setPodState(id, state, context: context)
                         running = nil
                     } else {
-                        machineHolds = observed.containers.map(\.id)
+                        machineHolds = Set(Self.diskImages(heldBy: observed))
                     }
                 }
 
@@ -573,8 +573,7 @@ public actor PodsService {
     static let standDownTimeout: Duration = .seconds(60)
 
     /// Refuse to place containers whose volumes another machine holds against
-    /// them, naming the containers of the running pods that mount those
-    /// volumes.
+    /// them, naming what holds each.
     ///
     /// Kubernetes' attach/detach controller does not attach a volume one node
     /// at a time may hold while another node holds it, and tells the pod
@@ -585,32 +584,46 @@ public actor PodsService {
     /// that writes and shared for one that reads, and that lock is the one
     /// record of a holder the host keeps. So a lock this service cannot take
     /// in the mode a mount needs is another machine holding the image, unless
-    /// the machine the containers go into holds it already, as the containers
-    /// it holds by its own word say, and shares it among them. The lock does
-    /// not say which machine holds the image, so the containers named are
-    /// those of the running pods that mount the volume.
+    /// the machine the containers go into holds it already, as it says, and
+    /// shares it among them: a pod's volume is the pod's until its machine
+    /// stops, whichever of its containers brought it. The lock does not say
+    /// which machine holds the image, so the holders named are the running
+    /// machines that say they hold it.
     /// https://github.com/kubernetes/kubernetes/blob/master/pkg/controller/volume/attachdetach/reconciler/reconciler.go
     private func refuseHeldVolumes(
         of placed: [String],
         in id: String,
-        machineHolds held: [String],
+        machineHolds held: Set<String>,
         containersService: ContainersService
     ) async throws {
         let all = try await containersService.list()
         let placing = Set(placed)
-        let holding = Set(held)
         let wanted = Self.volumes(of: all.filter { placing.contains($0.id) })
-        let machine = Self.volumes(of: all.filter { holding.contains($0.id) })
         for name in wanted.keys.sorted() {
-            guard let volume = wanted[name], machine[name] == nil else { continue }
-            guard Self.isHeld(image: volume.source, writes: volume.writes) else { continue }
-            let holders = all.filter { container in
-                container.configuration.pod != id
-                    && self.pods[container.configuration.pod]?.state == .ready
-                    && container.configuration.mounts.contains { $0.isVolume && $0.volumeName == name }
-            }
-            throw VolumeError.volumeInUse(name, containers: holders.map(\.id).sorted())
+            guard let volume = wanted[name], !held.contains(volume.source) else { continue }
+            guard VolumesService.isHeld(image: volume.source, writes: volume.writes) else { continue }
+            let holders = await self.holders(ofImage: volume.source, excluding: id)
+            throw VolumeError.volumeInUse(name, containers: holders.containers, pods: holders.pods)
         }
+    }
+
+    /// What holds the disk image at `path`, by the word of every machine but
+    /// the one of the pod `excluded` names.
+    private func holders(ofImage path: String, excluding excluded: String) async -> (containers: [String], pods: [String]) {
+        var snapshots: [PodSnapshot] = []
+        for state in self.pods.values where state.configuration.id != excluded {
+            snapshots.append(await self.snapshot(state))
+        }
+        return PodSnapshot.holders(ofImage: path, in: snapshots)
+    }
+
+    /// The disk images a machine holds by its own word, or, from a runtime
+    /// that does not say, those of the volumes its containers mount.
+    private static func diskImages(heldBy sandbox: SandboxSnapshot) -> [String] {
+        if let images = sandbox.diskImages {
+            return images
+        }
+        return Set(Self.volumes(of: sandbox.containers).values.map(\.source)).sorted()
     }
 
     /// The volumes the containers mount, by name, each with its disk image and
@@ -625,18 +638,6 @@ public actor PodsService {
             }
         }
         return volumes
-    }
-
-    /// Whether a machine holds the disk image at `path` against a mount of it:
-    /// one that writes needs the image's lock exclusive, one that reads needs
-    /// it shared. The lock is let go as soon as it is taken.
-    private static func isHeld(image path: String, writes: Bool) -> Bool {
-        let fd = open(path, O_RDONLY | O_CLOEXEC)
-        guard fd >= 0 else {
-            return false
-        }
-        defer { close(fd) }
-        return flock(fd, (writes ? LOCK_EX : LOCK_SH) | LOCK_NB) != 0 && errno == EWOULDBLOCK
     }
 
     /// What a held machine says of itself once it is not stopping, asked
@@ -820,16 +821,19 @@ public actor PodsService {
         // that answered ready after that would be offering a machine that is
         // not there.
         var ready = false
+        var diskImages: [String] = []
         if let client = state.client, let sandbox = try? await client.state() {
             networks = sandbox.networks
             ready = sandbox.status == .ready
+            diskImages = Self.diskImages(heldBy: sandbox)
         }
         return PodSnapshot(
             configuration: state.configuration,
             state: state.state == .ready && ready ? .ready : .notReady,
             networks: networks,
             containers: members.map { $0.id }.sorted(),
-            startedDate: state.startedDate
+            startedDate: state.startedDate,
+            diskImages: diskImages
         )
     }
 

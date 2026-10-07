@@ -57,6 +57,11 @@ public actor RuntimeService {
     /// The ports published on those addresses, which are the pod's because the
     /// addresses are, and are forwarded once for all of its containers.
     private var podPublishedPorts: [PublishPort] = []
+    /// The disk images the machine holds, by its word as of the last boot or
+    /// placement, the only acts that attach one. The state query reports
+    /// this rather than asking the machine, which answers only between its
+    /// own operations, so a query waits on none of them.
+    private var heldDiskImages: [String] = []
     private let monitor: ExitMonitor
     private let eventLoopGroup: any EventLoopGroup
     private var waiters: [String: ExitWaiter] = [:]
@@ -178,7 +183,16 @@ public actor RuntimeService {
                         message: "the machine is \(held) and takes no containers; wait for it to stop and start it again"
                     )
                 }
-                try await self.placeContainers(message)
+                // A placement that fails can still have attached a volume,
+                // which the machine then holds for its life, so what it holds
+                // is asked again either way.
+                do {
+                    try await self.placeContainers(message)
+                } catch {
+                    await self.refreshHeldDiskImages()
+                    throw error
+                }
+                await self.refreshHeldDiskImages()
                 return message.reply()
             }
 
@@ -374,6 +388,7 @@ public actor RuntimeService {
         let status: SandboxStatus
         var networks: [Attachment] = []
         var snapshots: [ContainerSnapshot] = []
+        var diskImages: [String] = []
 
         switch state {
         case .created:
@@ -393,6 +408,7 @@ public actor RuntimeService {
                         networks: $0.attachments
                     )
                 }
+            diskImages = self.heldDiskImages
         case .stopping:
             status = .stopping
         case .stopped:
@@ -406,7 +422,8 @@ public actor RuntimeService {
             .init(
                 status: status,
                 networks: networks,
-                containers: snapshots
+                containers: snapshots,
+                diskImages: diskImages
             )
         )
         return reply
@@ -1053,6 +1070,15 @@ public actor RuntimeService {
         await self.stopSocketForwarders()
         for session in networkSessions { session.close() }
         networkSessions = []
+        heldDiskImages = []
+    }
+
+    /// Read what the machine holds into the record the state query reports.
+    private func refreshHeldDiskImages() async {
+        guard let sandbox else {
+            return
+        }
+        heldDiskImages = await sandbox.heldDiskImages()
     }
 
     private func startExecProcess(processId id: String, lock: AsyncLock.Context) async throws {
@@ -1560,6 +1586,7 @@ public actor RuntimeService {
         try await self.placeContainers(message)
 
         try await pod.create()
+        await self.refreshHeldDiskImages()
         // The pod holds one address for every container in it, so the ports
         // published on it are the pod's and are forwarded once. Forwarding each
         // container's separately would let two of them claim one host port,

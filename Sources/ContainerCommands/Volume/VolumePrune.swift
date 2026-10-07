@@ -43,8 +43,12 @@ extension Application.VolumeCommand {
                 }
             }
 
+            // A running pod's machine holds a volume until the pod stops,
+            // whether or not a container still names it.
+            let held = Set(try await ClientPod.list().flatMap(\.diskImages))
+
             let volumesToPrune = allVolumes.filter { volume in
-                !volumesInUse.contains(volume.name)
+                !volumesInUse.contains(volume.name) && !held.contains(volume.source)
             }
 
             var prunedVolumes = [String]()
