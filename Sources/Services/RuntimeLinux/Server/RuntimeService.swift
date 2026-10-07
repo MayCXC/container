@@ -471,6 +471,64 @@ public actor RuntimeService {
         }
     }
 
+    /// Discard the free blocks of the container's root filesystem, so its
+    /// sparse backing file gives them back to the host.
+    ///
+    /// - Parameters:
+    ///   - message: An XPC message with no parameters.
+    ///
+    /// - Returns: An XPC message with the allocation of the file backing the
+    ///   container's root filesystem before and after the trim, under the
+    ///   allocatedBeforeBytes and allocatedAfterBytes keys.
+    @Sendable
+    public func trim(_ message: XPCMessage) async throws -> XPCMessage {
+        self.log.debug("enter", metadata: ["func": "\(#function)"])
+        defer { self.log.debug("exit", metadata: ["func": "\(#function)"]) }
+
+        let id = try message.id()
+
+        let allocation = try await self.lock.withLock { [self] _ in
+            switch await self.state {
+            case .ready:
+                // The discard runs inside the container's mounted root, so the
+                // container has to be running.
+                let ctr = try await self.getContainer(id)
+                guard ctr.status == .running else {
+                    throw ContainerizationError(
+                        .invalidState,
+                        message: "cannot trim: container \(id) is not running"
+                    )
+                }
+                // The guest reports the extents it discarded, which counts
+                // every free extent whether or not the host ever allocated
+                // it; what a caller wants is the space the host got back, so
+                // the backing file's allocation is read around the discard
+                // and both readings answered: the host punches the holes
+                // after the guest's call returns, so a caller reads the file
+                // across its own passes rather than trusting one window.
+                let block = try ctr.bundle.containerRootfs.source
+                let before = try Self.allocatedBytes(atPath: block)
+                let reported = try await self.getSandbox().trimContainer(id)
+                let after = try Self.allocatedBytes(atPath: block)
+                self.log.debug(
+                    "trimmed container root",
+                    metadata: ["id": "\(id)", "guestReported": "\(reported)", "allocatedBefore": "\(before)", "allocatedAfter": "\(after)"]
+                )
+                return (before, after)
+            default:
+                throw ContainerizationError(
+                    .invalidState,
+                    message: "cannot trim: the machine is not ready"
+                )
+            }
+        }
+
+        let reply = message.reply()
+        reply.set(key: RuntimeKeys.allocatedBeforeBytes.rawValue, value: allocation.0)
+        reply.set(key: RuntimeKeys.allocatedAfterBytes.rawValue, value: allocation.1)
+        return reply
+    }
+
     /// Stop the container a message is addressed to.
     ///
     /// The machine holds it and whatever else was put in it, and runs while any
@@ -1821,6 +1879,17 @@ public actor RuntimeService {
     /// a container's init process apart from a process an exec started.
     private func isContainer(_ id: String) -> Bool {
         self.containers[id] != nil
+    }
+
+    /// The bytes a file holds on disk as the filesystem allocates them: for
+    /// the sparse file backing a container's root, what the host has given
+    /// it rather than its apparent size.
+    private static func allocatedBytes(atPath path: String) throws -> UInt64 {
+        var status = stat()
+        guard stat(path, &status) == 0 else {
+            throw ContainerizationError(.internalError, message: "stat \(path): \(String(cString: strerror(errno)))")
+        }
+        return UInt64(status.st_blocks) * 512
     }
 
     /// A container in the machine, by name.

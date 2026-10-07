@@ -20,6 +20,7 @@ import Containerization
 import ContainerizationError
 import ContainerizationOCI
 import Foundation
+import Logging
 
 /// A client for interacting with the container API server.
 ///
@@ -311,6 +312,76 @@ public struct ContainerClient: Sendable {
                 cause: error
             )
         }
+    }
+
+    /// What a trim of a container's root filesystem measured on the host: the
+    /// allocation of the file backing it before and after the guest's discard,
+    /// and the bytes that gave back.
+    public struct Trim: Sendable {
+        public let allocatedBefore: UInt64
+        public let allocatedAfter: UInt64
+
+        public var returned: UInt64 {
+            allocatedBefore > allocatedAfter ? allocatedBefore - allocatedAfter : 0
+        }
+    }
+
+    /// Discard the free blocks of a running container's root filesystem, so its
+    /// sparse backing file gives them back to the host rather than holding the
+    /// high water mark of everything ever written to it. The guest agent
+    /// performs the trim on the container's own view of the filesystem, so it
+    /// reaches the blocks the container freed regardless of what the container
+    /// runs or which capabilities it holds. One pass: the host punches the
+    /// holes after the guest's call returns, so what a pass measures is a
+    /// floor, and ``reclaim(id:)`` is the figure to report.
+    @discardableResult
+    public func trim(id: String) async throws -> Trim {
+        let request = XPCMessage(route: .containerTrim)
+        request.set(key: .id, value: id)
+
+        do {
+            // Sized to the operation: a first trim walks every free extent of
+            // the filesystem, which can take tens of seconds on a large one.
+            let reply = try await xpcSend(message: request, timeout: .seconds(300))
+            return Trim(
+                allocatedBefore: reply.uint64(key: .allocatedBeforeBytes),
+                allocatedAfter: reply.uint64(key: .allocatedAfterBytes)
+            )
+        } catch {
+            throw ContainerizationError(
+                .internalError,
+                message: "failed to trim container \(id)",
+                cause: error
+            )
+        }
+    }
+
+    /// Trim a container's root filesystem until the host's allocation of its
+    /// backing file holds across two passes, and return what the host got back
+    /// from where the first pass found it. The guest frees blocks a beat after
+    /// the call that frees them returns (a build's cache after buildctl prune,
+    /// a file deleted on a root mounted with discard), and the host punches
+    /// their holes after that, so passes are three seconds apart, at most
+    /// eight.
+    @discardableResult
+    public func reclaim(id: String) async throws -> Trim {
+        let first = try await trim(id: id)
+        var last = first
+        var held = 0
+        for _ in 1..<8 {
+            try await Task.sleep(for: .seconds(3))
+            let pass = try await trim(id: id)
+            if pass.allocatedAfter == last.allocatedAfter {
+                held += 1
+            } else {
+                held = 0
+            }
+            last = pass
+            if held >= 2 {
+                break
+            }
+        }
+        return Trim(allocatedBefore: first.allocatedBefore, allocatedAfter: last.allocatedAfter)
     }
 
     /// Get the disk usage for a container.
