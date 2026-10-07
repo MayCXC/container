@@ -145,14 +145,19 @@ final public class ContainerConfig: Codable, Sendable {
 
 final public class DNSConfig: Codable, Sendable {
     public let domain: String?
+    /// System default for whether the network's own resolver leads a container's
+    /// own nameservers, used when a container sets no dns-gateway of its own.
+    public let gateway: Bool?
 
-    public init(domain: String? = nil) {
+    public init(domain: String? = nil, gateway: Bool? = nil) {
         self.domain = domain
+        self.gateway = gateway
     }
 
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.domain = try container.decodeIfPresent(String.self, forKey: .domain)
+        self.gateway = try container.decodeIfPresent(Bool.self, forKey: .gateway)
     }
 }
 
