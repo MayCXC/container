@@ -92,21 +92,52 @@ public actor RuntimeService {
         }
     }
 
-    private static func sshAuthSocketHostUrl(
-        config: ContainerConfiguration,
-        dynamicEnv: [String: String] = [:],
+    /// Point the container's agent link at an agent socket.
+    ///
+    /// The relay resolves the link on every guest connection, so the link is
+    /// the stable host side of the forwarding and this is the whole of a
+    /// donation: build the new link beside the old and rename it into place,
+    /// so a guest connection always resolves either the old donation or the
+    /// new one.
+    private static func donateAgentSocket(
+        link: URL,
+        socket: String,
         log: Logger? = nil
-    ) -> URL? {
-        guard config.ssh else {
-            return nil
+    ) throws {
+        let previous = link.resolvingSymlinksInPath().path
+        let staging = link.appendingPathExtension("next")
+        try? FileManager.default.removeItem(at: staging)
+        try FileManager.default.createSymbolicLink(at: staging, withDestinationURL: URL(fileURLWithPath: socket))
+        guard Darwin.rename(staging.path, link.path) == 0 else {
+            throw ContainerizationError(.internalError, message: "failed to replace agent link: errno \(errno)")
         }
+        // A forwarding changes hands rarely, and when it stops working
+        // afterwards this line is the only account of what it was pointed at
+        // and what replaced it, so it is kept rather than left at debug.
+        log?.info(
+            "pointed the agent link",
+            metadata: ["from": "\(previous)", "to": "\(socket)"])
+    }
 
-        guard let sshSocket = dynamicEnv[Self.sshAuthSocketEnvVar] else {
-            log?.warning("ssh forwarding requested but no \(Self.sshAuthSocketEnvVar) found")
-            return nil
+    /// Point a container's forwarding at the agent its caller names.
+    ///
+    /// SSH_AUTH_SOCK says where an agent is and nothing about how long it will
+    /// be there, so there is nothing here to judge: a caller that names one is
+    /// asking for it, and a caller that names none leaves the forwarding as it
+    /// was. A container whose agent has since gone away is an ordinary state,
+    /// and a client that finds no agent falls back, which is what the
+    /// convention is for.
+    private func donateAgentSocket(container: ContainerInfo, dynamicEnv: [String: String]) {
+        guard let socket = dynamicEnv[Self.sshAuthSocketEnvVar] else {
+            return
         }
-
-        return URL(fileURLWithPath: sshSocket)
+        var log = self.log
+        log[metadataKey: "container"] = "\(container.id)"
+        do {
+            try Self.donateAgentSocket(link: container.bundle.sshAuthSocketLink, socket: socket, log: log)
+        } catch {
+            log.error("failed to point the agent link", metadata: ["error": "\(error)"])
+        }
     }
 
     public init(
@@ -322,6 +353,10 @@ public actor RuntimeService {
                         .invalidState,
                         message: "cannot exec: container \(container.id) is not running"
                     )
+                }
+
+                if container.config.ssh {
+                    await self.donateAgentSocket(container: container, dynamicEnv: try message.dynamicEnv())
                 }
 
                 try await self.addNewProcess(id, in: container.id, config, stdio)
@@ -1289,7 +1324,7 @@ public actor RuntimeService {
     /// and the host's ssh agent when it asked for one.
     private static func sockets(
         config: ContainerConfiguration,
-        dynamicEnv: [String: String],
+        agentLink: URL?,
         log: Logger?
     ) throws -> (sockets: [UnixSocketConfiguration], mounts: [Filesystem]) {
         var sockets: [UnixSocketConfiguration] = []
@@ -1323,14 +1358,18 @@ public actor RuntimeService {
                 ))
         }
 
-        if let socketUrl = Self.sshAuthSocketHostUrl(config: config, dynamicEnv: dynamicEnv, log: log) {
-            let socketPath = socketUrl.path(percentEncoded: false)
-            let attrs = try? FileManager.default.attributesOfItem(atPath: socketPath)
+        if config.ssh, let agentLink {
+            // The relay resolves the link on every guest connection, so the
+            // forwarding exists whenever it was asked for and serves
+            // whatever donation the link names; a container created without
+            // an agent heals the moment a later exec donates one.
+            let resolved = agentLink.resolvingSymlinksInPath()
+            let attrs = try? FileManager.default.attributesOfItem(atPath: resolved.path(percentEncoded: false))
             let permissions = (attrs?[.posixPermissions] as? NSNumber)
                 .map { FilePermissions(rawValue: mode_t($0.intValue)) }
             sockets.append(
                 UnixSocketConfiguration(
-                    source: socketUrl,
+                    source: agentLink,
                     destination: URL(fileURLWithPath: Self.sshAuthSocketGuestPath),
                     permissions: permissions,
                     direction: .into,
@@ -1360,7 +1399,7 @@ public actor RuntimeService {
     private static func configurePodContainer(
         czConfig: inout LinuxPod.ContainerConfiguration,
         config: ContainerConfiguration,
-        dynamicEnv: [String: String] = [:],
+        agentLink: URL? = nil,
         log: Logger? = nil,
     ) throws {
         // A container in a pod draws on the machine's processors and memory
@@ -1388,7 +1427,7 @@ public actor RuntimeService {
             }
         }
 
-        let (sockets, mounts) = try Self.sockets(config: config, dynamicEnv: dynamicEnv, log: log)
+        let (sockets, mounts) = try Self.sockets(config: config, agentLink: agentLink, log: log)
         czConfig.sockets.append(contentsOf: sockets)
         czConfig.mounts.append(contentsOf: mounts.map { $0.asMount })
 
@@ -1693,11 +1732,15 @@ public actor RuntimeService {
         // A container the machine already holds keeps its place. One that is
         // running is left as it is; one that is stopped, whether it ran and
         // exited or was placed and never started, is given this request's
-        // streams for its next start.
+        // streams for its next start, and its forwarding is pointed at the
+        // agent the request names, the way an exec's is.
         let id = URL(filePath: path).lastPathComponent
         if let held = self.containers[id] {
             guard held.status != .running else {
                 return
+            }
+            if held.config.ssh {
+                self.donateAgentSocket(container: held, dynamicEnv: dynamicEnv)
             }
             try await self.rebind(held, stdio: stdio)
             return
@@ -1728,11 +1771,17 @@ public actor RuntimeService {
             let io = try Self.streams(of: bundle, config: config, stdio: stdio)
             let attachments = self.podAttachments
 
+            if config.ssh {
+                if let socket = dynamicEnv[Self.sshAuthSocketEnvVar] {
+                    try Self.donateAgentSocket(link: bundle.sshAuthSocketLink, socket: socket, log: self.log)
+                }
+            }
+
             try await pod.addContainer(config.id, rootfs: rootfs) { czConfig in
                 try Self.configurePodContainer(
                     czConfig: &czConfig,
                     config: config,
-                    dynamicEnv: dynamicEnv,
+                    agentLink: config.ssh ? bundle.sshAuthSocketLink : nil,
                     log: self.log
                 )
             }
