@@ -48,17 +48,46 @@ public struct PodSnapshot: Codable, Sendable {
     /// When the pod was started.
     public var startedDate: Date?
 
+    /// The disk images the pod's machine holds, by host path: each volume
+    /// one of its containers brought, held from when the machine attached it
+    /// until the machine stops, whether or not a container still mounts it.
+    /// Empty when the machine is not running.
+    public var diskImages: [String]
+
     public init(
         configuration: PodConfiguration,
         state: PodState,
         networks: [Attachment],
         containers: [String] = [],
-        startedDate: Date? = nil
+        startedDate: Date? = nil,
+        diskImages: [String] = []
     ) {
         self.configuration = configuration
         self.state = state
         self.networks = networks
         self.containers = containers
         self.startedDate = startedDate
+        self.diskImages = diskImages
+    }
+
+    /// What holds the disk image at `path` among `pods`. A pod someone named
+    /// is named itself, since its machine holds a volume until the pod stops
+    /// whichever of its containers brought it; a pod a container was given is
+    /// named by its containers, since it stops with them. Kubernetes names the
+    /// pods using a volume another node is refused, and the pods a claim's
+    /// deletion waits on.
+    /// https://github.com/kubernetes/kubernetes/blob/master/pkg/controller/volume/attachdetach/reconciler/reconciler.go
+    /// https://kubernetes.io/docs/concepts/storage/persistent-volumes/#storage-object-in-use-protection
+    public static func holders(ofImage path: String, in pods: [PodSnapshot]) -> (containers: [String], pods: [String]) {
+        var containers: [String] = []
+        var named: [String] = []
+        for pod in pods where pod.diskImages.contains(path) {
+            if pod.configuration.isAnonymous {
+                containers += pod.containers
+            } else {
+                named.append(pod.id)
+            }
+        }
+        return (containers.sorted(), named.sorted())
     }
 }

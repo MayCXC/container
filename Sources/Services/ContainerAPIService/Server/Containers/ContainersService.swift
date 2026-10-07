@@ -515,6 +515,13 @@ public actor ContainersService {
         return try await podsService.client(for: pod).addressing(id)
     }
 
+    /// Whether a request to a machine's service failed because the service is
+    /// gone: the XPC client answers a broken connection as interrupted, and the
+    /// runtime client carries that as the cause of its own error.
+    private static func serviceIsGone(_ error: ContainerizationError) -> Bool {
+        error.code == .interrupted || (error.cause as? ContainerizationError)?.code == .interrupted
+    }
+
     /// Create a new process in the container.
     public func createProcess(
         id: String,
@@ -1163,10 +1170,19 @@ public actor ContainersService {
         // A machine that is up keeps a stopped container's place, its root
         // filesystem attached, until the container is removed from it; the
         // bundle holding that filesystem goes only once the machine has let
-        // it go. A pod whose machine is down holds no place to give up.
+        // it go. A pod whose machine is down holds no place to give up, and
+        // neither does one whose service the connection finds gone, since the
+        // service holds the machine: a machine stopping with its container
+        // can be gone before the pod hears of it.
         // https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
         if let pod, let client = try? await self.podClient(for: pod, member: id) {
-            try await client.removeContainer()
+            do {
+                try await client.removeContainer()
+            } catch let error as ContainerizationError where Self.serviceIsGone(error) {
+                self.log.info(
+                    "the machine holding the container is gone, so no place is left to give up",
+                    metadata: ["id": "\(id)", "pod": "\(pod)", "error": "\(error)"])
+            }
         }
 
         // Always try to delete the bundle directory, even if it's incomplete

@@ -46,12 +46,16 @@ extension Application.VolumeCommand {
                 }
             }
 
+            // A running pod's machine holds a volume until the pod stops,
+            // whether or not a container still names it.
+            let held = Set(try await ClientPod.list().flatMap(\.diskImages))
+
             // A volume someone named is theirs, and one nothing mounts yet is
             // still theirs to mount, so a prune leaves it alone unless asked for
             // all of them. A volume nobody named was made because a container
             // was given one, and is of no use to anyone once nothing mounts it.
             let volumesToPrune = allVolumes.filter { volume in
-                guard !volumesInUse.contains(volume.name) else {
+                guard !volumesInUse.contains(volume.name), !held.contains(volume.source) else {
                     return false
                 }
                 return all || volume.isAnonymous
