@@ -55,7 +55,13 @@ import GRPCCore
 actor BuildFSSync: BuildPipelineHandler {
     let contextDir: URL
 
-    init(_ contextDir: URL) throws {
+    /// Local `--build-context` directories by name. The host is the sole
+    /// authority for this mapping: the shim only ever names a context, and a
+    /// name outside this map is refused, so the builder VM cannot steer the
+    /// host toward a path that was never declared on the command line.
+    let namedContexts: [String: URL]
+
+    init(_ contextDir: URL, namedContexts: [String: URL] = [:]) throws {
         let resolved = contextDir.resolvingSymlinksInPath()
         guard FileManager.default.fileExists(atPath: contextDir.cleanPath) else {
             throw Error.contextNotFound(contextDir.cleanPath)
@@ -64,7 +70,42 @@ actor BuildFSSync: BuildPipelineHandler {
             throw Error.contextIsNotDirectory(contextDir.cleanPath)
         }
 
+        var resolvedNamed: [String: URL] = [:]
+        for (name, dir) in namedContexts {
+            let resolvedDir = dir.resolvingSymlinksInPath()
+            guard FileManager.default.fileExists(atPath: dir.cleanPath) else {
+                throw Error.contextNotFound(dir.cleanPath)
+            }
+            guard resolvedDir.isDirectory else {
+                throw Error.contextIsNotDirectory(dir.cleanPath)
+            }
+            resolvedNamed[name] = resolvedDir
+        }
+
         self.contextDir = resolved
+        self.namedContexts = resolvedNamed
+    }
+
+    /// Resolve the context root a transfer operates on from the dir-name the
+    /// shim relayed. Every serving path (walk, read, info) resolves through
+    /// here, so the same containment enforcement applies to every root.
+    ///
+    /// This mirrors BuildKit's own session provider, which resolves the
+    /// `dir-name` metadata through a registered directory source and answers
+    /// NotFound for a name it does not hold, so a name is the only thing a
+    /// requester can choose and the server keeps the paths. The primary
+    /// context and the dockerfile directory arrive under BuildKit's default
+    /// names for them.
+    /// https://github.com/moby/buildkit/blob/v0.29.0/session/filesync/filesync.go
+    /// https://github.com/moby/buildkit/blob/v0.29.0/frontend/dockerui/context.go
+    private func contextRoot(_ packet: BuildTransfer) throws -> URL {
+        guard let name = packet.dirName(), name != "context", name != "dockerfile" else {
+            return self.contextDir
+        }
+        guard let root = self.namedContexts[name] else {
+            throw Error.unknownNamedContext(name)
+        }
+        return root
     }
 
     nonisolated func accept(_ packet: ServerStream) throws -> Bool {
@@ -102,22 +143,23 @@ actor BuildFSSync: BuildPipelineHandler {
     func read(_ sender: AsyncStream<ClientStream>.Continuation, _ packet: BuildTransfer, _ buildID: String) async throws {
         let offset: UInt64 = packet.offset() ?? 0
         let size: Int = packet.len() ?? 0
+        let root = try contextRoot(packet)
         var path: URL
         if packet.source.hasPrefix("/") {
             path = URL(fileURLWithPath: packet.source).standardizedFileURL
         } else {
             path =
-                contextDir
+                root
                 .appendingPathComponent(packet.source)
                 .standardizedFileURL
         }
         if !FileManager.default.fileExists(atPath: path.cleanPath) {
-            path = URL(filePath: self.contextDir.cleanPath)
+            path = URL(filePath: root.cleanPath)
             path.append(components: packet.source.cleanPathComponent)
         }
         let resolved = path.resolvingSymlinksInPath()
-        guard self.contextDir.parentOf(resolved) else {
-            throw Error.pathIsNotChild(resolved.cleanPath, self.contextDir.cleanPath)
+        guard root.parentOf(resolved) else {
+            throw Error.pathIsNotChild(resolved.cleanPath, root.cleanPath)
         }
         let data = try {
             if try path.isDir() {
@@ -127,7 +169,7 @@ actor BuildFSSync: BuildPipelineHandler {
             return try file.data(offset: offset, length: size) ?? Data()
         }()
 
-        let transfer = try path.buildTransfer(id: packet.id, contextDir: self.contextDir, complete: true, data: data)
+        let transfer = try path.buildTransfer(id: packet.id, contextDir: root, complete: true, data: data)
         var response = ClientStream()
         response.buildID = buildID
         response.buildTransfer = transfer
@@ -142,20 +184,21 @@ actor BuildFSSync: BuildPipelineHandler {
     /// normal `Walk`-based build. Must reject paths that escape the context root
     /// via symlinks for the same reasons as ``read(_:_:_:)``.
     func info(_ sender: AsyncStream<ClientStream>.Continuation, _ packet: BuildTransfer, _ buildID: String) async throws {
+        let root = try contextRoot(packet)
         let path: URL
         if packet.source.hasPrefix("/") {
             path = URL(fileURLWithPath: packet.source).standardizedFileURL
         } else {
             path =
-                contextDir
+                root
                 .appendingPathComponent(packet.source)
                 .standardizedFileURL
         }
         let resolved = path.resolvingSymlinksInPath()
-        guard self.contextDir.parentOf(resolved) else {
-            throw Error.pathIsNotChild(resolved.cleanPath, self.contextDir.cleanPath)
+        guard root.parentOf(resolved) else {
+            throw Error.pathIsNotChild(resolved.cleanPath, root.cleanPath)
         }
-        let transfer = try path.buildTransfer(id: packet.id, contextDir: self.contextDir, complete: true)
+        let transfer = try path.buildTransfer(id: packet.id, contextDir: root, complete: true)
         var response = ClientStream()
         response.buildID = buildID
         response.buildTransfer = transfer
@@ -200,30 +243,32 @@ actor BuildFSSync: BuildPipelineHandler {
         _ buildID: String
     ) async throws {
         let wantsTar = packet.mode() == "tar"
+        let root = try contextRoot(packet)
 
         var entries: [String: Set<DirEntry>] = [:]
         let followPaths: [String] = packet.followPaths() ?? []
 
-        let followPathsWalked = try walk(root: self.contextDir, includePatterns: followPaths)
+        let followPathsWalked = try walk(root: root, includePatterns: followPaths)
+
         for url in followPathsWalked {
-            guard self.contextDir.absoluteURL.cleanPath != url.absoluteURL.cleanPath else {
+            guard root.absoluteURL.cleanPath != url.absoluteURL.cleanPath else {
                 continue
             }
-            guard self.contextDir.parentOf(url) else {
+            guard root.parentOf(url) else {
                 continue
             }
 
-            let relPath = try url.relativeChildPath(to: contextDir)
-            let parentPath = try url.deletingLastPathComponent().relativeChildPath(to: contextDir)
+            let relPath = try url.relativeChildPath(to: root)
+            let parentPath = try url.deletingLastPathComponent().relativeChildPath(to: root)
             let entry = DirEntry(url: url, isDirectory: url.hasDirectoryPath, relativePath: relPath)
             entries[parentPath, default: []].insert(entry)
 
             if url.isSymlink {
                 let target: URL = url.resolvingSymlinksInPath()
-                if self.contextDir.parentOf(target) {
-                    let relPath = try target.relativeChildPath(to: self.contextDir)
+                if root.parentOf(target) {
+                    let relPath = try target.relativeChildPath(to: root)
                     let entry = DirEntry(url: target, isDirectory: target.hasDirectoryPath, relativePath: relPath)
-                    let parentPath: String = try target.deletingLastPathComponent().relativeChildPath(to: self.contextDir)
+                    let parentPath: String = try target.deletingLastPathComponent().relativeChildPath(to: root)
                     entries[parentPath, default: []].insert(entry)
                 }
             }
@@ -234,7 +279,7 @@ actor BuildFSSync: BuildPipelineHandler {
 
         if !wantsTar {
             let fileInfos = try fileOrder.map { rel -> FileInfo in
-                try FileInfo(path: contextDir.appendingPathComponent(rel), contextDir: contextDir)
+                try FileInfo(path: root.appendingPathComponent(rel), contextDir: root)
             }
 
             let data = try JSONEncoder().encode(fileInfos)
@@ -268,15 +313,15 @@ actor BuildFSSync: BuildPipelineHandler {
             filter: .none)
 
         let tarHash = try Archiver.compress(
-            source: contextDir,
+            source: root,
             destination: tarURL,
             writerConfiguration: writerCfg
         ) { url in
-            guard let rel = try? url.relativeChildPath(to: contextDir) else {
+            guard let rel = try? url.relativeChildPath(to: root) else {
                 return nil
             }
 
-            guard let parent = try? url.deletingLastPathComponent().relativeChildPath(to: self.contextDir) else {
+            guard let parent = try? url.deletingLastPathComponent().relativeChildPath(to: root) else {
                 return nil
             }
 
@@ -450,6 +495,7 @@ extension BuildFSSync {
         case couldNotDetermineUID(String)
         case couldNotDetermineGID(String)
         case pathIsNotChild(String, String)
+        case unknownNamedContext(String)
 
         var description: String {
             switch self {
@@ -477,6 +523,8 @@ extension BuildFSSync {
                 return "could not determine GID of file at path: \(path)"
             case .pathIsNotChild(let path, let parent):
                 return "\(path) is not a child of \(parent)"
+            case .unknownNamedContext(let name):
+                return "no --build-context named \(name) was declared"
             }
         }
     }
