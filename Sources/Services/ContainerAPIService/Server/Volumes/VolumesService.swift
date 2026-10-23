@@ -14,6 +14,7 @@
 // limitations under the License.
 //===----------------------------------------------------------------------===//
 
+import ContainerAPIClient
 import ContainerPersistence
 import ContainerResource
 import Containerization
@@ -31,17 +32,15 @@ public actor VolumesService {
     private let store: ContainerPersistence.FilesystemEntityStore<VolumeConfiguration>
     private let log: Logger
     private let lock = AsyncLock()
-    private let containersService: ContainersService
+    private let containers = ContainerClient()
 
     // Storage constants
     private static let entityFile = "entity.json"
     private static let blockFile = "volume.img"
 
-    public init(resourceRoot: FilePath, containersService: ContainersService, log: Logger) async throws {
-        try FileManager.default.createDirectory(atPath: resourceRoot.string, withIntermediateDirectories: true)
+    public init(resourceRoot: FilePath, log: Logger) async throws {
         self.resourceRoot = resourceRoot
         self.store = try FilesystemEntityStore<VolumeConfiguration>(path: resourceRoot, type: "volumes", log: log)
-        self.containersService = containersService
         self.log = log
 
         // Migrate configs stored with the old `createdAt` key to `creationDate`.
@@ -179,7 +178,7 @@ public actor VolumesService {
 
     /// Calculate disk usage for volumes
     /// - Returns: Tuple of (total count, active count, total size, reclaimable size)
-    public func calculateDiskUsage() async throws -> (Int, Int, UInt64, UInt64) {
+    public func calculateDiskUsage() async throws -> ResourceUsage {
         log.debug(
             "VolumesService: enter",
             metadata: [
@@ -198,35 +197,28 @@ public actor VolumesService {
         return try await lock.withLock { _ in
             let allVolumes = try await self.store.list()
 
-            // Atomically get active volumes with container list
-            return try await self.containersService.withContainerList(logMetadata: ["acquirer": "\(#function)"]) { containers in
-                var inUseSet = Set<String>()
+            let inUseSet = try await self.containers.volumeNamesInUse()
 
-                // Find all mounted volumes
-                for container in containers {
-                    for mount in container.configuration.mounts {
-                        if mount.isVolume, let volumeName = mount.volumeName {
-                            inUseSet.insert(volumeName)
-                        }
-                    }
+            var totalSize: UInt64 = 0
+            var reclaimableSize: UInt64 = 0
+
+            // Calculate sizes
+            for volume in allVolumes {
+                let volumePath = self.volumePath(for: volume.name)
+                let volumeSize = FileManager.default.allocatedSize(of: URL(fileURLWithPath: volumePath))
+                totalSize += volumeSize
+
+                if !inUseSet.contains(volume.name) {
+                    reclaimableSize += volumeSize
                 }
-
-                var totalSize: UInt64 = 0
-                var reclaimableSize: UInt64 = 0
-
-                // Calculate sizes
-                for volume in allVolumes {
-                    let volumePath = self.volumePath(for: volume.name)
-                    let volumeSize = FileManager.default.allocatedSize(of: URL(fileURLWithPath: volumePath))
-                    totalSize += volumeSize
-
-                    if !inUseSet.contains(volume.name) {
-                        reclaimableSize += volumeSize
-                    }
-                }
-
-                return (allVolumes.count, inUseSet.count, totalSize, reclaimableSize)
             }
+
+            return ResourceUsage(
+                total: allVolumes.count,
+                active: inUseSet.count,
+                sizeInBytes: totalSize,
+                reclaimable: reclaimableSize
+            )
         }
     }
 
@@ -372,19 +364,16 @@ public actor VolumesService {
             throw VolumeError.volumeNotFound(name)
         }
 
-        // Check if volume is in use by any container atomically
-        try await containersService.withContainerList(logMetadata: ["acquirer": "\(#function)", "name": "\(name)"]) { containers in
-            for container in containers {
-                for mount in container.configuration.mounts {
-                    if mount.isVolume && mount.volumeName == name {
-                        throw VolumeError.volumeInUse(name)
-                    }
-                }
-            }
-
-            try await self.store.delete(name)
-            try self.removeVolumeDirectory(for: name)
+        // A container created after this answer can name the volume and lose
+        // it, the same window image delete accepts against container create;
+        // the create then fails naming the missing volume.
+        let referencing = try await containers.containersReferencingVolume(name)
+        guard referencing.isEmpty else {
+            throw VolumeError.volumeInUse(name)
         }
+
+        try await self.store.delete(name)
+        try self.removeVolumeDirectory(for: name)
 
         log.info("deleted volume", metadata: ["name": "\(name)"])
     }

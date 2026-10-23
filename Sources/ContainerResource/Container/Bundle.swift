@@ -23,9 +23,11 @@ public struct Bundle: Sendable {
     private static let kernelFilename = "kernel.json"
     private static let kernelBinaryFilename = "kernel.bin"
     private static let containerRootFsBlockFilename = "rootfs.ext4"
+    private static let containerSwapBlockFilename = "swap.raw"
     private static let containerRootFsFilename = "rootfs.json"
 
     static let containerConfigFilename = "config.json"
+    static let podConfigFilename = "pod.json"
 
     /// The path to the bundle.
     public let path: URL
@@ -40,6 +42,11 @@ public struct Bundle: Sendable {
 
     public var containerRootfsBlock: URL {
         self.path.appendingPathComponent(Self.containerRootFsBlockFilename)
+    }
+
+    /// The raw block file backing the container's swap area, when it has one.
+    public var containerSwapBlock: URL {
+        self.path.appendingPathComponent(Self.containerSwapBlockFilename)
     }
 
     private var containerRootfsConfig: URL {
@@ -75,6 +82,22 @@ public struct Bundle: Sendable {
             try load(path: self.path.appendingPathComponent(Self.containerConfigFilename))
         }
     }
+
+    /// The configuration of the pod this bundle holds, when the bundle is a
+    /// pod's rather than a single container's.
+    public var podConfiguration: PodConfiguration {
+        get throws {
+            try load(path: self.path.appendingPathComponent(Self.podConfigFilename))
+        }
+    }
+
+    /// Whether this bundle holds a pod, whose containers keep bundles of their
+    /// own, rather than a single container.
+    public var isPod: Bool {
+        FileManager.default.fileExists(
+            atPath: self.path.appendingPathComponent(Self.podConfigFilename).path
+        )
+    }
 }
 
 extension Bundle {
@@ -83,6 +106,7 @@ extension Bundle {
         initialFilesystem: Filesystem,
         kernel: Kernel,
         containerConfiguration: ContainerConfiguration? = nil,
+        podConfiguration: PodConfiguration? = nil,
         containerRootFilesystem: Filesystem? = nil,
         options: ContainerCreateOptions? = nil
     ) throws -> Bundle {
@@ -110,6 +134,10 @@ extension Bundle {
             try bundle.write(filename: Self.containerConfigFilename, value: containerConfiguration)
         }
 
+        if let podConfiguration {
+            try bundle.write(filename: Self.podConfigFilename, value: podConfiguration)
+        }
+
         if let rootFsOverride = options?.rootFsOverride {
             try bundle.setContainerRootFs(fs: rootFsOverride)
         } else if let containerRootFilesystem {
@@ -128,6 +156,24 @@ extension Bundle {
     /// Set the value of the configuration for the Bundle.
     public func set(configuration: ContainerConfiguration) throws {
         try write(filename: Self.containerConfigFilename, value: configuration)
+    }
+
+    /// Set the configuration of the pod this bundle holds.
+    public func set(podConfiguration: PodConfiguration) throws {
+        try write(filename: Self.podConfigFilename, value: podConfiguration)
+    }
+
+    /// Replace the bundle's copy of the initial filesystem with a copy of
+    /// the one given, which the next machine booted from the bundle runs.
+    public func setInitialFilesystem(cloning fs: Filesystem) throws {
+        guard case .block(let format, _, _) = fs.type, format == "ext4" else {
+            throw ContainerizationError(.invalidArgument, message: "initial filesystem must be an ext4 block, got \(fs.type)")
+        }
+        let target = self.path.appendingPathComponent(Self.initfsFilename)
+        if FileManager.default.fileExists(atPath: target.path) {
+            try FileManager.default.removeItem(at: target)
+        }
+        _ = try fs.clone(to: target.path)
     }
 
     /// Return the full filepath for a named resource in the Bundle.

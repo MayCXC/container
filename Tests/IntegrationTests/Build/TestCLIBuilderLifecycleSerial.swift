@@ -40,6 +40,27 @@ struct TestCLIBuilderLifecycleSerial {
         }
     }
 
+    @Test func testBuilderStartRightAfterStop() async throws {
+        try await ContainerFixture.with { f in
+            f.addCleanup { try? f.builderDelete(force: true) }
+
+            try f.builderStart()
+            try await f.waitForBuilderRunning()
+            let pod = try f.inspectContainer("buildkit").configuration.pod
+
+            // The stop returns with the builder stopped and its machine still
+            // going down; a start arriving then waits for the machine to finish
+            // and boots a fresh one for the same builder.
+            try f.builderStop()
+            try f.builderStart()
+            try await f.waitForBuilderRunning()
+            #expect(try f.getContainerStatus("buildkit") == "running", "buildkit container should be running")
+            #expect(
+                try f.inspectContainer("buildkit").configuration.pod == pod,
+                "the stopped builder itself should be started again, not deleted and recreated")
+        }
+    }
+
     @Test func testBuilderEnvironmentColors() async throws {
         try await ContainerFixture.with { f in
             let originalColors = ProcessInfo.processInfo.environment["BUILDKIT_COLORS"]

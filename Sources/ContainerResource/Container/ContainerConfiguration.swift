@@ -30,8 +30,6 @@ public struct ContainerConfiguration: Sendable, Codable {
     public var publishedSockets: [PublishSocket] = []
     /// Key/Value labels for the container.
     public var labels: [String: String] = [:]
-    /// System controls for the container.
-    public var sysctls: [String: String] = [:]
     /// The networks the container will be added to.
     public var networks: [AttachmentConfiguration] = []
     /// The DNS configuration for the container.
@@ -45,6 +43,15 @@ public struct ContainerConfiguration: Sendable, Codable {
     /// Resource values for the container.
     public var resources: Resources = .init()
     /// Name of the runtime that supports the container.
+    /// The pod the container runs in.
+    ///
+    /// A container is always in one, sharing that pod's machine with whatever
+    /// else is in it, so a container alone in a pod is the same arrangement
+    /// with one member. A caller that names no pod is asking for one of its
+    /// own and is given a name for it before the container is made, which is
+    /// why this is not a question the rest of the code has to ask.
+    public var pod: String = PodConfiguration.generateId()
+
     public var runtimeHandler: String = "container-runtime-linux"
     /// Configure exposing virtualization support in the container.
     public var virtualization: Bool = false
@@ -80,13 +87,13 @@ public struct ContainerConfiguration: Sendable, Codable {
         case publishedPorts
         case publishedSockets
         case labels
-        case sysctls
         case networks
         case dns
         case rosetta
         case initProcess
         case platform
         case resources
+        case pod
         case runtimeHandler
         case virtualization
         case ssh
@@ -112,7 +119,6 @@ public struct ContainerConfiguration: Sendable, Codable {
         publishedPorts = try container.decodeIfPresent([PublishPort].self, forKey: .publishedPorts) ?? []
         publishedSockets = try container.decodeIfPresent([PublishSocket].self, forKey: .publishedSockets) ?? []
         labels = try container.decodeIfPresent([String: String].self, forKey: .labels) ?? [:]
-        sysctls = try container.decodeIfPresent([String: String].self, forKey: .sysctls) ?? [:]
 
         if container.contains(.networks) {
             networks = try container.decode([AttachmentConfiguration].self, forKey: .networks)
@@ -125,6 +131,12 @@ public struct ContainerConfiguration: Sendable, Codable {
         initProcess = try container.decode(ProcessConfiguration.self, forKey: .initProcess)
         platform = try container.decodeIfPresent(ContainerizationOCI.Platform.self, forKey: .platform) ?? .current
         resources = try container.decodeIfPresent(Resources.self, forKey: .resources) ?? .init()
+        // A container written before a container was always in a pod carries
+        // no pod, and there is no machine for it to be in. It fails to read,
+        // and a container that fails to read is taken away at boot, which is
+        // what already happens to any container this version cannot make sense
+        // of.
+        pod = try container.decode(String.self, forKey: .pod)
         runtimeHandler = try container.decodeIfPresent(String.self, forKey: .runtimeHandler) ?? "container-runtime-linux"
         virtualization = try container.decodeIfPresent(Bool.self, forKey: .virtualization) ?? false
         ssh = try container.decodeIfPresent(Bool.self, forKey: .ssh) ?? false
@@ -166,6 +178,11 @@ public struct ContainerConfiguration: Sendable, Codable {
         public var cpus: Int = 4
         /// Memory in bytes allocated.
         public var memoryInBytes: UInt64 = 1024.mib()
+        /// Swap in bytes allocated. When set, a raw block device of this size
+        /// backs the container's swap area, which the guest enables so that a
+        /// workload exceeding `memoryInBytes` reclaims to it. Counts swap
+        /// alone, not the memory and swap total the runtime spec carries.
+        public var swapInBytes: UInt64?
         /// Storage quota/size in bytes.
         public var storage: UInt64?
         /// Additional CPU cores allocated for VM overhead (guest agent, etc).
@@ -177,6 +194,7 @@ public struct ContainerConfiguration: Sendable, Codable {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             self.cpus = try c.decodeIfPresent(Int.self, forKey: .cpus) ?? 4
             self.memoryInBytes = try c.decodeIfPresent(UInt64.self, forKey: .memoryInBytes) ?? 1024.mib()
+            self.swapInBytes = try c.decodeIfPresent(UInt64.self, forKey: .swapInBytes)
             self.storage = try c.decodeIfPresent(UInt64.self, forKey: .storage)
             self.cpuOverhead = try c.decodeIfPresent(Int.self, forKey: .cpuOverhead) ?? 1
         }
