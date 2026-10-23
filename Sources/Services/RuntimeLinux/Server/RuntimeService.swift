@@ -1659,6 +1659,12 @@ public actor RuntimeService {
             cpus: config.resources.cpus + config.resources.cpuOverhead,
             memoryInBytes: config.resources.memoryInBytes + VMResources.guestMemoryOverhead
         )
+        // The machine attaches its containers' disks on the block device
+        // driver the system configuration names, for a pod and a container's
+        // own machine alike, as Kata's runtime gives every block device of a
+        // sandbox the driver the sandbox's configuration names.
+        // https://github.com/kata-containers/kata-containers/blob/ea7aba03b1d48813cae07413c95ab6bc464b7a5f/src/runtime/pkg/device/manager/manager.go#L55-L67
+        let systemConfig: ContainerSystemConfig = try await ConfigurationLoader.load()
         let pod = try LinuxPod(config.id, vmm: vmm, vm: machine, logger: self.log) { podConfig in
             // Hold the machine at what its guest needs plus a buffer and give
             // the rest back to the host. Every workload the runtime boots is a
@@ -1713,6 +1719,7 @@ public actor RuntimeService {
                 )
             }
             podConfig.bootLog = BootLog.file(path: bundle.bootlog, append: true)
+            podConfig.blockDeviceDriver = systemConfig.container.blockDeviceDriver
         }
 
         self.setSandbox(pod)

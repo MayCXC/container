@@ -90,6 +90,7 @@ Defaults applied when `container run` / `container create` is invoked without `-
 |----------|------------|---------|----------------------------------------------------------------------------|
 | `cpus`   | `Int`      | `4`     | Default CPU count per container.                                           |
 | `memory` | [MemorySize](#memorysize-format) | `"1g"`  | Default RAM per container. |
+| `blockDeviceDriver` | `String` | `"virtio-blk"` | Driver a container's machine attaches the container's disks on, for a pod and a container's own machine alike: `"virtio-blk"` gives each disk a virtio block device of its own, and `"virtio-scsi"` makes each a logical unit of the machine's one SCSI host, which takes disks while the machine runs and needs macOS 27. Kata's `block_device_driver` sets the same choice. |
 
 ## `[dns]`
 
