@@ -16,6 +16,7 @@
 
 import ArgumentParser
 import ContainerAPIClient
+import ContainerPersistence
 import ContainerizationOCI
 import Foundation
 
@@ -33,7 +34,19 @@ extension Application {
         var all: Bool = false
 
         public func run() async throws {
-            let allImages = try await ClientImage.list()
+            let containerSystemConfig: ContainerSystemConfig = try await Application.loadContainerSystemConfig()
+
+            // The builder and the guest agent belong to the runtime rather than
+            // to the user. `image list` does not show them and `image delete`
+            // refuses them, so pruning them would take images that were never
+            // offered, and the next build would have nothing to run in.
+            let allImages = try await ClientImage.list().filter { image in
+                !Utility.isInfraImage(
+                    name: image.reference,
+                    builderImage: containerSystemConfig.build.image,
+                    initImage: containerSystemConfig.vminit.image
+                )
+            }
 
             let imagesToPrune: [ClientImage]
             if all {
