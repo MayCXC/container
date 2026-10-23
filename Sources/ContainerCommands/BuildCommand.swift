@@ -168,6 +168,13 @@ extension Application {
         @Option(name: .long, help: ArgumentHelp("Builder shim vsock port", valueName: "port"))
         var vsockPort: UInt32 = 8088
 
+        @Option(
+            name: .customLong("builder"),
+            help: ArgumentHelp(
+                "Builder address (ssh://user@host[:port] or tcp://host:port); defaults to CONTAINER_BUILD_REMOTE, then build.remote in the configuration, then this machine's builder [environment: CONTAINER_BUILD_REMOTE]",
+                valueName: "address"))
+        var builderAddress: String?
+
         @OptionGroup
         public var logOptions: Flags.Logging
 
@@ -182,6 +189,16 @@ extension Application {
 
         public func run() async throws {
             let containerSystemConfig: ContainerSystemConfig = try await Application.loadContainerSystemConfig()
+            // The builder this build rides, when it is not this machine's. The
+            // address grammar is BUILDKIT_HOST's, and the precedence is the
+            // flag, then the environment, then the configuration, the way
+            // buildctl's --addr rides over BUILDKIT_HOST and the way
+            // CONTAINER_DEFAULT_PLATFORM slots between flag and default here.
+            let remoteAddress = try
+                (self.builderAddress
+                ?? ProcessInfo.processInfo.environment["CONTAINER_BUILD_REMOTE"]
+                ?? containerSystemConfig.build.remote)
+                .map(RemoteBuilderAddress.parse)
             // The blobs an image export writes gather in an ingest session
             // rather than landing in the store as they arrive. The store takes
             // the whole set at the moment it records the images naming them,
@@ -217,24 +234,35 @@ extension Application {
                 let dnsNameservers = self.dns.nameservers
 
                 // Ensure the builder is started (or restarted) with the correct SSH configuration
-                // before attempting to dial. This handles the case where the builder is already
-                // running but was not started with SSH forwarding enabled.
-                try await BuilderStart.start(
-                    cpus: cpus,
-                    memory: memory,
-                    log: log,
-                    ssh: ssh == "default",
-                    dnsNameservers: dnsNameservers,
-                    progressUpdate: progress.handler,
-                    containerSystemConfig: containerSystemConfig,
-                )
+                // A remote builder is dialed as it stands: its lifecycle is
+                // its machine's, so nothing here starts or restarts it.
+                if remoteAddress == nil {
+                    // before attempting to dial. This handles the case where the builder is already
+                    // running but was not started with SSH forwarding enabled.
+                    try await BuilderStart.start(
+                        cpus: cpus,
+                        memory: memory,
+                        log: log,
+                        ssh: ssh == "default",
+                        dnsNameservers: dnsNameservers,
+                        progressUpdate: progress.handler,
+                        containerSystemConfig: containerSystemConfig,
+                    )
+                }
 
-                let builder: Builder? = try await withThrowingTaskGroup(of: Builder.self) { [vsockPort, cpus, memory, dnsNameservers, ssh] group in
+                let builder: Builder? = try await withThrowingTaskGroup(of: Builder.self) { [vsockPort, cpus, memory, dnsNameservers, ssh, remoteAddress] group in
                     defer {
                         group.cancelAll()
                     }
 
-                    group.addTask { [vsockPort, cpus, memory, log, dnsNameservers, ssh] in
+                    group.addTask { [vsockPort, cpus, memory, log, dnsNameservers, ssh, remoteAddress] in
+                        if let remoteAddress {
+                            let connection = try RemoteBuilderConnection.connect(remoteAddress)
+                            let threadGroup = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
+                            let b = try await Builder(socket: connection.handle, group: threadGroup, logger: log)
+                            let _ = try await b.info()
+                            return b
+                        }
                         let client = ContainerClient()
                         while true {
                             do {
@@ -563,6 +591,11 @@ extension Application {
             // returns them to the host, so the sparse backing file tracks what
             // the cache is using rather than the high water mark of every build.
             // Best effort: a build that succeeded is not failed by a reclaim.
+            // A remote builder's space is its machine's to reclaim, as its
+            // lifecycle is, so only a build on this machine's builder trims it.
+            guard remoteAddress == nil else {
+                return
+            }
             do {
                 try await ContainerClient().reclaim(id: "buildkit")
             } catch {
