@@ -45,14 +45,20 @@ public struct SandboxSnapshot: Codable, Sendable {
     public var networks: [Attachment]
     /// Containers placed in the sandbox, each with its own status.
     public var containers: [ContainerSnapshot]
+    /// The disk images the machine holds, by host path, each from when the
+    /// machine attached it until the machine stops, whether or not a
+    /// container still mounts it. Nil from a runtime that does not say.
+    public var diskImages: [String]?
 
     public init(
         status: SandboxStatus,
         networks: [Attachment],
-        containers: [ContainerSnapshot]
+        containers: [ContainerSnapshot],
+        diskImages: [String]? = nil
     ) {
         self.status = status
         self.networks = networks
         self.containers = containers
+        self.diskImages = diskImages
     }
 }

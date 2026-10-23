@@ -57,6 +57,11 @@ public actor RuntimeService {
     /// The ports published on those addresses, which are the pod's because the
     /// addresses are, and are forwarded once for all of its containers.
     private var podPublishedPorts: [PublishPort] = []
+    /// The disk images the machine holds, by its word as of the last boot or
+    /// placement, the only acts that attach one. The state query reports
+    /// this rather than asking the machine, which answers only between its
+    /// own operations, so a query waits on none of them.
+    private var heldDiskImages: [String] = []
     private let monitor: ExitMonitor
     private let eventLoopGroup: any EventLoopGroup
     private var waiters: [String: ExitWaiter] = [:]
@@ -209,7 +214,16 @@ public actor RuntimeService {
                         message: "the machine is \(held) and takes no containers; wait for it to stop and start it again"
                     )
                 }
-                try await self.placeContainers(message)
+                // A placement that fails can still have attached a volume,
+                // which the machine then holds for its life, so what it holds
+                // is asked again either way.
+                do {
+                    try await self.placeContainers(message)
+                } catch {
+                    await self.refreshHeldDiskImages()
+                    throw error
+                }
+                await self.refreshHeldDiskImages()
                 return message.reply()
             }
 
@@ -409,6 +423,7 @@ public actor RuntimeService {
         let status: SandboxStatus
         var networks: [Attachment] = []
         var snapshots: [ContainerSnapshot] = []
+        var diskImages: [String] = []
 
         switch state {
         case .created:
@@ -428,6 +443,7 @@ public actor RuntimeService {
                         networks: $0.attachments
                     )
                 }
+            diskImages = self.heldDiskImages
         case .stopping:
             status = .stopping
         case .stopped:
@@ -441,7 +457,8 @@ public actor RuntimeService {
             .init(
                 status: status,
                 networks: networks,
-                containers: snapshots
+                containers: snapshots,
+                diskImages: diskImages
             )
         )
         return reply
@@ -489,7 +506,15 @@ public actor RuntimeService {
                         exitStatuses[id] = status
                     }
                 }
-                try await sandbox.stop()
+                // The machine is down or failed once its stop returns, and
+                // what it held is let go either way, as the runtime cleans a
+                // container's own machine up past a failed stop.
+                // https://github.com/apple/container/blob/main/Sources/Services/RuntimeLinux/Server/RuntimeService.swift
+                do {
+                    try await sandbox.stop()
+                } catch {
+                    self.log.error("failed to stop the machine", metadata: ["error": "\(error)"])
+                }
 
                 if case .stopped = await self.state {
                     return message.reply()
@@ -1078,38 +1103,57 @@ public actor RuntimeService {
             // nobody named stops with the last thing in it, here as when a
             // container exits.
             // https://github.com/kubernetes/kubernetes/blob/master/pkg/kubelet/kuberuntime/kuberuntime_manager.go
-            try? await sandbox.stopContainer(id)
-            await self.containerExited(info, exitStatus: nil)
-            try? await self.stopMachineIfEmpty()
+            do {
+                try await sandbox.stopContainer(id)
+            } catch {
+                self.log.error("failed to stop a container whose start failed", metadata: ["id": "\(id)", "error": "\(error)"])
+            }
+            do {
+                try await self.recordExit(info, exitStatus: nil)
+            } catch {
+                self.log.error("failed to record the end of a container whose start failed", metadata: ["id": "\(id)", "error": "\(error)"])
+            }
             throw error
         }
     }
 
-    /// Stop a machine that exists for its containers once none is left in it.
+    /// Record that a container's init process has gone, stopping first a
+    /// machine that exists for its containers and has no other one running.
     ///
     /// A pod's machine is its sandbox, which outlives the containers that come
     /// and go in it: it holds the addresses and namespaces they share and is
     /// taken down when the pod is, not when a container in it leaves. A machine
     /// nobody named exists for its one container, so it stops with the last
     /// thing in it and releases the devices it held; the boot request says
-    /// which kind this machine is. Called with the lock held.
+    /// which kind this machine is. Such a machine stops before the exit is
+    /// recorded and its waiters answered, as the runtime stops a container's
+    /// own machine before it releases the container's waiters: whoever waited
+    /// acts on the end at once, and the machine's stop is what unmounts the
+    /// container's volumes and syncs what it wrote. Called with the lock held.
     /// https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
-    private func stopMachineIfEmpty() async throws {
+    /// https://github.com/apple/container/blob/main/Sources/Services/RuntimeLinux/Server/RuntimeService.swift
+    private func recordExit(_ info: ContainerInfo, exitStatus: ExitStatus?) async throws {
         let sandbox = try self.getSandbox()
-        if sandbox is LinuxPod, !self.sandboxStopsWithContainers {
-            return
+        let stopsMachine =
+            !(sandbox is LinuxPod && !self.sandboxStopsWithContainers)
+            && !self.containers.values.contains { $0.id != info.id && $0.status == .running }
+        if stopsMachine {
+            // The machine is on its way down from here and says so to whoever
+            // asks meanwhile, as the stop route does, so that a start arriving
+            // during the teardown waits for its end rather than reading a
+            // running machine that is gone by the time its request lands.
+            self.setState(.stopping)
+            do {
+                try await sandbox.stop()
+            } catch {
+                self.log.error("failed to stop the machine its last container left", metadata: ["id": "\(info.id)", "error": "\(error)"])
+            }
+            await self.releaseMachineResources()
         }
-        guard !self.containers.values.contains(where: { $0.status == .running }) else {
-            return
+        await self.containerExited(info, exitStatus: exitStatus)
+        if stopsMachine {
+            self.setState(.stopped)
         }
-        // The machine is on its way down from here and says so to whoever
-        // asks meanwhile, as the stop route does, so that a start arriving
-        // during the teardown waits for its end rather than reading a
-        // running machine that is gone by the time its request lands.
-        self.setState(.stopping)
-        try? await sandbox.stop()
-        await self.releaseMachineResources()
-        self.setState(.stopped)
     }
 
     /// Give up what the machine held for its containers once it has stopped:
@@ -1119,6 +1163,15 @@ public actor RuntimeService {
         await self.stopSocketForwarders()
         for session in networkSessions { session.close() }
         networkSessions = []
+        heldDiskImages = []
+    }
+
+    /// Read what the machine holds into the record the state query reports.
+    private func refreshHeldDiskImages() async {
+        guard let sandbox else {
+            return
+        }
+        heldDiskImages = await sandbox.heldDiskImages()
     }
 
     private func startExecProcess(processId id: String, lock: AsyncLock.Context) async throws {
@@ -1257,9 +1310,7 @@ public actor RuntimeService {
             } catch {
                 self.log.error("failed to stop container after its exit", metadata: ["id": "\(id)", "error": "\(error)"])
             }
-            await self.containerExited(ctrInfo, exitStatus: exitStatus)
-
-            try await self.stopMachineIfEmpty()
+            try await self.recordExit(ctrInfo, exitStatus: exitStatus)
         }
     }
 
@@ -1672,6 +1723,7 @@ public actor RuntimeService {
         try await self.placeContainers(message)
 
         try await pod.create()
+        await self.refreshHeldDiskImages()
         // The pod holds one address for every container in it, so the ports
         // published on it are the pod's and are forwarded once. Forwarding each
         // container's separately would let two of them claim one host port,

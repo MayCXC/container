@@ -197,7 +197,12 @@ public actor VolumesService {
         return try await lock.withLock { _ in
             let allVolumes = try await self.store.list()
 
-            let inUseSet = try await self.containers.volumeNamesInUse()
+            // A running pod's machine holds a volume until the pod stops,
+            // whether or not a container still names it.
+            var inUseSet = try await self.containers.volumeNamesInUse()
+            for volume in allVolumes where Self.isHeld(image: self.blockPath(for: volume.name), writes: true) {
+                inUseSet.insert(volume.name)
+            }
 
             var totalSize: UInt64 = 0
             var reclaimableSize: UInt64 = 0
@@ -249,6 +254,21 @@ public actor VolumesService {
 
     private nonisolated func blockPath(for name: String) -> String {
         "\(volumePath(for: name))/\(Self.blockFile)"
+    }
+
+    /// Whether a machine holds the disk image at `path` against a mount of it:
+    /// one that writes needs the image's lock exclusive, one that reads needs
+    /// it shared. Virtualization locks a disk it attaches and a machine's
+    /// virtio-scsi host locks an image it attaches, exclusive for a mount that
+    /// writes and shared for one that reads, so the lock is the host's record
+    /// of a holder. The lock is let go as soon as it is taken.
+    static func isHeld(image path: String, writes: Bool) -> Bool {
+        let fd = open(path, O_RDONLY | O_CLOEXEC)
+        guard fd >= 0 else {
+            return false
+        }
+        defer { close(fd) }
+        return flock(fd, (writes ? LOCK_EX : LOCK_SH) | LOCK_NB) != 0 && errno == EWOULDBLOCK
     }
 
     private func createVolumeDirectory(for name: String) throws {
@@ -367,9 +387,23 @@ public actor VolumesService {
         // A container created after this answer can name the volume and lose
         // it, the same window image delete accepts against container create;
         // the create then fails naming the missing volume.
+        //
+        // A running pod's machine holds a volume until the pod stops, after
+        // the container that brought it is gone, so a volume no container
+        // names can still be in use: Kubernetes keeps a claim a pod uses from
+        // being removed, since removing it loses the data. The image's lock
+        // is the host's record of a machine holding it, and the pods say
+        // which machines those are.
+        // https://kubernetes.io/docs/concepts/storage/persistent-volumes/#storage-object-in-use-protection
         let referencing = try await containers.containersReferencingVolume(name)
-        guard referencing.isEmpty else {
-            throw VolumeError.volumeInUse(name)
+        let image = blockPath(for: name)
+        let held = Self.isHeld(image: image, writes: true)
+        guard referencing.isEmpty, !held else {
+            var holders: (containers: [String], pods: [String]) = ([], [])
+            if held {
+                holders = PodSnapshot.holders(ofImage: image, in: (try? await ClientPod.list()) ?? [])
+            }
+            throw VolumeError.volumeInUse(name, containers: Set(referencing + holders.containers).sorted(), pods: holders.pods)
         }
 
         try await self.store.delete(name)
