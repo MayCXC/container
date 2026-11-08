@@ -25,7 +25,7 @@ import SystemPackage
 /// "use the container runtime default."
 public struct MachineConfig: Codable, Sendable {
     public static let `default`: MachineConfig = try! .init(
-        cpus: nil, memory: nil, homeMount: nil, virtualization: nil, kernelPath: nil)
+        cpus: nil, memory: nil, homeMount: nil, virtualization: nil, memAgent: nil, kernelPath: nil)
 
     public static var defaultCPUs: Int {
         max(ProcessInfo.processInfo.processorCount / 2, 4)
@@ -54,6 +54,8 @@ public struct MachineConfig: Codable, Sendable {
     public let homeMount: HomeMountOption
     /// Whether to expose nested virtualization to the container machine.
     public let virtualization: Bool
+    /// Whether to run mem-agent in the container machine's guest.
+    public let memAgent: Bool
     /// Optional path to a custom kernel binary. nil falls back to the system default.
     public let kernelPath: FilePath?
 
@@ -62,6 +64,7 @@ public struct MachineConfig: Codable, Sendable {
         case memory
         case homeMount
         case virtualization
+        case memAgent
         case kernelPath
     }
 
@@ -71,6 +74,10 @@ public struct MachineConfig: Codable, Sendable {
         ("memory", "<size>", "Memory allocation (e.g., 2G, 1G). Default: half of system memory"),
         ("home-mount", "<string>", "User home directory mount option (ro, rw, none). Default: rw"),
         ("virtualization", "<bool>", "Enable nested virtualization (true|false). Requires Apple Silicon M3+ and macOS 15+ and kernel with CONFIG_KVM=y."),
+        (
+            "mem-agent", "<bool>",
+            "Run mem-agent to reclaim and compact the guest's memory (true|false). Requires an init image with mem-agent-srv and a kernel with CONFIG_LRU_GEN=y and CONFIG_PSI=y."
+        ),
         ("kernel", "<path>", "Path to a custom kernel binary. Empty value resets to the system default."),
     ]
 
@@ -79,12 +86,14 @@ public struct MachineConfig: Codable, Sendable {
         memory: MemorySize?,
         homeMount: HomeMountOption?,
         virtualization: Bool?,
+        memAgent: Bool?,
         kernelPath: FilePath?
     ) throws {
         self.cpus = cpus ?? Self.defaultCPUs
         self.memory = memory ?? Self.defaultMemory
         self.homeMount = homeMount ?? Self.defaultHomeMount
         self.virtualization = virtualization ?? false
+        self.memAgent = memAgent ?? false
         self.kernelPath = kernelPath
 
         try self.validate()
@@ -97,6 +106,7 @@ public struct MachineConfig: Codable, Sendable {
         let memory = try container.decodeIfPresent(MemorySize.self, forKey: .memory)
         let homeMount = try container.decodeIfPresent(HomeMountOption.self, forKey: .homeMount)
         let virtualization = try container.decodeIfPresent(Bool.self, forKey: .virtualization)
+        let memAgent = try container.decodeIfPresent(Bool.self, forKey: .memAgent)
         // FilePath's default Codable conformance encodes its internal SystemChar storage,
         // which the project's ConfigSnapshotDecoder can't handle. Persist as a plain String
         // and lift to FilePath in memory.
@@ -107,6 +117,7 @@ public struct MachineConfig: Codable, Sendable {
             memory: memory,
             homeMount: homeMount,
             virtualization: virtualization,
+            memAgent: memAgent,
             kernelPath: kernelPath)
     }
 
@@ -116,6 +127,7 @@ public struct MachineConfig: Codable, Sendable {
         try container.encode(memory, forKey: .memory)
         try container.encode(homeMount, forKey: .homeMount)
         try container.encode(virtualization, forKey: .virtualization)
+        try container.encode(memAgent, forKey: .memAgent)
         try container.encodeIfPresent(kernelPath?.string, forKey: .kernelPath)
     }
 
@@ -161,6 +173,7 @@ extension MachineConfig {
         let memory = try kwargs["memory"].map { try MemorySize($0) }
         let homeMount = try kwargs["home-mount"].map { try Self.parseHomeMount($0) }
         let virtualization = try kwargs["virtualization"].map { try Self.parseBool($0, for: "virtualization") }
+        let memAgent = try kwargs["mem-agent"].map { try Self.parseBool($0, for: "mem-agent") }
         // Empty string explicitly clears the kernel override; absent key leaves it unchanged.
         let kernelPath: FilePath?
         if let raw = kwargs["kernel"] {
@@ -174,6 +187,7 @@ extension MachineConfig {
             memory: memory ?? self.memory,
             homeMount: homeMount ?? self.homeMount,
             virtualization: virtualization ?? self.virtualization,
+            memAgent: memAgent ?? self.memAgent,
             kernelPath: kernelPath
         )
     }

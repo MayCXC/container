@@ -110,6 +110,20 @@ container run --name nested-virtualization --virtualization --kernel /path/to/a/
 [    0.017893] kvm [1]: Hyp mode initialized successfully
 ```
 
+## Reclaim and compact a machine's memory with mem-agent
+
+> [!NOTE]
+> This feature requires an init image that carries `mem-agent-srv` at `/sbin/mem-agent-srv` and a shell at `/bin/sh`, and a Linux kernel built with `CONFIG_LRU_GEN=y` and `CONFIG_PSI=y`. The recommended kernel has both, since Kata Containers builds it with [its mem-agent configuration](https://github.com/kata-containers/kata-containers/blob/3.32.0/tools/packaging/kernel/configs/fragments/common/mem_agent.conf). The default init image does not carry `mem-agent-srv`; containerization's `make build-mem-agent` builds it and a static busybox for the shell, which [a custom init image](#use-a-custom-init-image) can add at those paths.
+
+The `--mem-agent` option runs [mem-agent](https://github.com/kata-containers/kata-containers/blob/3.32.0/docs/how-to/how-to-use-memory-agent.md), the guest memory manager of Kata Containers, in the machine a container or pod runs in. mem-agent reclaims the memory each cgroup has not used lately and compacts the machine's free memory, and backs off while the machine shows memory or IO pressure. The option is available on `container run`, `container create`, `container pod create`, and `container machine create`, and as the `mem-agent` setting of `container machine set`.
+
+mem-agent switches the kernel's multi-gen LRU on when it starts, so a container sees it enabled:
+
+```console
+container run --mem-agent --init-image local/mem-agent-init:latest --rm alpine:latest cat /sys/kernel/mm/lru_gen/enabled
+0x0001
+```
+
 ## Run a container with a provided init process
 
 By default, the command you specify in `container run` runs as PID 1 inside the container. This means it is responsible for reaping zombie processes and handling signals, which many applications are not designed to do. The `--init` flag runs a lightweight init process as PID 1 that automatically forwards signals and reaps orphaned child processes.
